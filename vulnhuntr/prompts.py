@@ -300,7 +300,7 @@ Analyze the code in <file_code> for potential remotely exploitable vulnerabiliti
    - Cross-Site Scripting (XSS)
    - SQL Injection (SQLI)
    - Insecure Direct Object Reference (IDOR)
-3. Note any security controls or sanitization measures encountered along the way so you can craft bypass techniques for the proof of concept (PoC).
+3. Note any security controls or sanitization measures encountered along the way.
 4. Instead of requesting context in this pass, list the vulnerability candidates you want to investigate in follow-up, and the symbols that are likely relevant (functions/classes/methods/modules). The system will schedule a follow-up iteration per vulnerability.
 
 Important exclusions:
@@ -328,8 +328,6 @@ Output in <summary></summary> XML tags.
 GUIDELINES_TEMPLATE = """Reporting Guidelines:
 1. JSON Format:
    - Provide a single, well-formed JSON report combining all findings.
-   - Use 'None' for any aspect of the report that you lack the necessary information for.
-   - Place your step-by-step analysis in the scratchpad field, before doing a final analysis in the analysis field.
    - Important: Do NOT wrap the JSON in quotes, markdown code fences, or any additional text. Output ONLY raw JSON.
    - Do NOT return JSON nested inside a string. The top-level output must be a JSON object matching the schema.
 
@@ -343,12 +341,69 @@ GUIDELINES_TEMPLATE = """Reporting Guidelines:
    - Report only remotely exploitable vulnerabilities (no local access/CLI args).
    - Always include at least one vulnerability_type field when requesting context.
    - Provide a confidence score (0-10) and detailed justification for each vulnerability.
-     - If your proof of concept (PoC) exploit does not start with remote user input via remote networking calls such as remote HTTP, API, or RPC calls, set the confidence score to 6 or below.
-   
+
 4. Proof of Concept:
    - Include a PoC exploit or detailed exploitation steps for each vulnerability.
    - Ensure PoCs are specific to the analyzed code, not generic examples.
-   - Review the code path ofthe potential vulnerability and be sure that the PoC bypasses any security controls in the code path.
+   - Confirm that PoCs bypass any security controls in the relevant code path.
+"""
+
+# Initial-phase specific guidelines and approach (no PoC references)
+GUIDELINES_TEMPLATE_INITIAL = """Reporting Guidelines (Initial Analysis):
+1. JSON Format:
+   - Provide a single, well-formed JSON object matching the schema.
+   - Output ONLY raw JSON. No quotes, no code fences, no extra text.
+
+2. Scope:
+   - Identify remotely exploitable vulnerability candidates only.
+   - Do not include proof-of-concept exploits in this phase.
+
+3. Requirements:
+   - Include at least one vulnerability_type if any plausible candidate is identified.
+   - Provide a confidence score (0-10) with brief justification.
+"""
+
+ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
+1. Comprehensive Review:
+   - Thoroughly examine the content in <file_code>, <context_code> tags (if provided) with a focus on remotely exploitable vulnerabilities.
+
+2. Vulnerability Scanning:
+   - You only care about remotely exploitable network related components and remote user input handlers.
+   - Identify potential entry points for vulnerabilities.
+   - Consider non-obvious attack vectors and edge cases.
+
+3. Code Path Analysis:
+   - Very important: trace the flow of user input from remote request source to function sink.
+   - Examine input validation, sanitization, and encoding practices.
+   - Analyze how data is processed, stored, and output.
+
+4. Security Control Analysis:
+   - Evaluate each security measure's implementation and effectiveness.
+   - Formulate potential bypass techniques, considering latest exploit methods.
+
+6. Context-Aware Analysis:
+   - If this is a follow-up analysis, build upon previous findings in <previous_analysis> using the new information provided in the <context_code>.
+   - In follow-up iterations you may request additional context. Use structured context_code entries with the following fields for each item:
+     - name: symbol name (function, method, class, or module)
+     - symbol_kind: one of function|method|class|module
+     - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
+     - reason: brief justification
+     - code_line: an anchor line where the symbol is referenced
+   - Example requests:
+     - {"name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow", "code_line": "user = load_user(uid)"}
+     - {"name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input", "code_line": "parse_request(req)"}
+   - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
+
+7. Final Review:
+   - Confirm your proof of concept (PoC) exploits bypass any security controls.
+   - Double-check that your JSON response is well-formed and complete."""
+
+ANALYSIS_APPROACH_TEMPLATE_INITIAL = """Analysis Instructions (Initial, be concise):
+1. Review code in <file_code> to identify remotely exploitable vulnerability candidates.
+2. Trace likely input-to-sink paths at a high level; do not request context.
+3. Note relevant symbols to investigate in follow-up (definitions or callers).
+4. Do not include proof-of-concept exploits in this phase.
+5. Ensure the response conforms to the provided JSON schema.
 """
 
 ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):

@@ -4,6 +4,9 @@ import argparse
 import json
 import os
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import queue as queue_mod
 import structlog
 from vulnhuntr.symbol_finder import SymbolExtractor
 from vulnhuntr.LLMs import Claude, ChatGPT, Ollama, OpenRouter
@@ -58,7 +61,6 @@ class Response(BaseModel):
 
 class ResponseInitial(BaseModel):
     analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.", min_length=64)
-    poc: str = Field(description="Proof-of-concept exploit, if applicable.")
     confidence_score: int = Field(description="0-10, where 0 is no confidence and 10 is absolute certainty because you have the entire user input to server output code path.")
     vulnerability_types: List[VulnType] = Field(description="The types of identified vulnerabilities")
 
@@ -132,6 +134,172 @@ def _is_proto_or_generated(path: str) -> bool:
         '/generated/' in pl or
         '\\generated\\' in pl
     )
+
+class FileWriter:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.q: queue_mod.Queue[dict] = queue_mod.Queue()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def enqueue(self, record: dict) -> None:
+        self.q.put(record)
+
+    def _run(self) -> None:
+        with self.path.open('a', encoding='utf-8') as f:
+            while not self.stop_event.is_set() or not self.q.empty():
+                try:
+                    rec = self.q.get(timeout=0.1)
+                except Exception:
+                    continue
+                f.write(json.dumps(rec) + "\n")
+                self.q.task_done()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.q.join()
+        self.thread.join(timeout=2)
+
+def process_initial_task(task: Task,
+                         primary_writer: 'FileWriter',
+                         llm: Claude | ChatGPT | Ollama | OpenRouter,
+                         primary_map: dict[str, dict]) -> list[Task]:
+    py_f = Path(task.file_path)
+    try:
+        with py_f.open(encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        log.error("Initial read failed", file=str(py_f), exc_info=e)
+        return []
+    if not content:
+        return []
+    if task.file_path in primary_map:
+        log.info("Skipping already analyzed file", file=task.file_path)
+        return []
+    print(f"\nAnalyzing {py_f}")
+    print('-' * 40 +'\n')
+    user_prompt = (
+        FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
+        Instructions(instructions=INITIAL_ANALYSIS_PROMPT_TEMPLATE).to_xml() + b'\n' +
+        AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE_INITIAL).to_xml() + b'\n' +
+        PreviousAnalysis(previous_analysis='').to_xml() + b'\n' +
+        Guidelines(guidelines=GUIDELINES_TEMPLATE_INITIAL).to_xml() + b'\n' +
+        ResponseFormat(response_format=json.dumps(ResponseInitial.model_json_schema(), indent=4)).to_xml()
+    ).decode()
+    log.info("Initial analysis prompt", user_prompt=user_prompt)
+    report: ResponseInitial = llm.chat(user_prompt, response_model=ResponseInitial)
+    log.info("Initial analysis complete", report=report.model_dump())
+    rec = {"file_path": str(py_f), **report.model_dump()}
+    try:
+        primary_writer.enqueue(rec)
+    except Exception as e:
+        log.error("Primary enqueue failed", exc_info=e)
+    primary_map[str(py_f)] = rec
+    print_readable(report)
+    # build secondary tasks
+    new_secondaries: list[Task] = []
+    if report.confidence_score > 0 and len(report.vulnerability_types):
+        for vt in report.vulnerability_types:
+            if not _is_proto_or_generated(str(py_f)):
+                new_secondaries.append(Task(
+                    type=TaskType.SECONDARY,
+                    file_path=str(py_f),
+                    vuln_type=vt,
+                    iteration_count=0,
+                    previous_analysis=report.analysis,
+                ))
+    return new_secondaries
+
+def process_secondary_task(task: Task,
+                           secondary_writer: 'FileWriter',
+                           final_writer: 'FileWriter',
+                           llm: Claude | ChatGPT | Ollama | OpenRouter,
+                           primary_map: dict[str, dict],
+                           secondary_map: dict[str, dict[str, list]],
+                           code_extractor: SymbolExtractor,
+                           files: List[Path]) -> Task | None:
+    py_f = Path(task.file_path)
+    if not task.vuln_type:
+        return None
+    try:
+        with py_f.open(encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        log.error("Secondary read failed", file=str(py_f), exc_info=e)
+        return None
+    if not content:
+        return None
+    i = task.iteration_count or 0
+    stored_defs = task.stored_code_definitions or {}
+    previous_context_amount = len(stored_defs)
+    definitions = CodeDefinitions(definitions=list(stored_defs.values()))
+    # Build vuln-specific prompt including the initial analysis text as previous_analysis
+    initial_text = primary_map.get(str(py_f), {}).get('analysis', '')
+    vuln_specific_user_prompt = (
+        FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
+        definitions.to_xml() + b'\n' +
+        ExampleBypasses(example_bypasses='\n'.join(VULN_SPECIFIC_BYPASSES_AND_PROMPTS[task.vuln_type]['bypasses'])).to_xml() + b'\n' +
+        Instructions(instructions=VULN_SPECIFIC_BYPASSES_AND_PROMPTS[task.vuln_type]['prompt']).to_xml() + b'\n' +
+        AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
+        PreviousAnalysis(previous_analysis=initial_text).to_xml() + b'\n' +
+        Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
+        ResponseFormat(response_format=json.dumps(Response.model_json_schema(), indent=4)).to_xml()
+    ).decode()
+    log.info("Secondary analysis for file and vulnerability type", file=py_f, vuln_type=task.vuln_type)
+    secondary_analysis_report: Response = llm.chat(vuln_specific_user_prompt, response_model=Response)
+    log.info("Secondary analysis complete", secondary_analysis_report=secondary_analysis_report.model_dump())
+    rec2 = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
+    try:
+        secondary_writer.enqueue(rec2)
+    except Exception as e:
+        log.error("Secondary enqueue failed", exc_info=e)
+    secondary_map.setdefault(str(py_f), {}).setdefault(task.vuln_type, []).append(rec2)
+    if secondary_analysis_report and secondary_analysis_report.analysis and len(secondary_analysis_report.analysis):
+        log.debug("Secondary analysis text length", length=len(secondary_analysis_report.analysis))
+    if len(secondary_analysis_report.context_code):
+        log.debug("Secondary context_code count", count=len(secondary_analysis_report.context_code))
+    # Update stored definitions with newly requested context
+    added = 0
+    for context_item in secondary_analysis_report.context_code:
+        req_type = context_item.request_type
+        name = context_item.name
+        code_line = context_item.code_line
+        if req_type == 'REQUEST_DEFINITION':
+            if name not in stored_defs:
+                match = code_extractor.extract(name, code_line, files)
+                if match:
+                    stored_defs[name] = match
+                    added += 1
+        elif req_type == 'REQUEST_CALLERS':
+            callers = code_extractor.find_callers(name, list(files))
+            for caller in callers:
+                _ = caller  # currently not enqueuing new initials here
+    # Determine next iteration or finalize
+    next_i = i + 1
+    current_no_progress = (added == 0)
+    finalize_now = (next_i >= 7) or (task.same_context and current_no_progress)
+    if finalize_now:
+        final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
+        try:
+            final_writer.enqueue(final_rec)
+        except Exception as e:
+            log.error("Final enqueue failed", exc_info=e)
+        print_readable(secondary_analysis_report)
+        return None
+    else:
+        return Task(
+            type=TaskType.SECONDARY,
+            file_path=str(py_f),
+            vuln_type=task.vuln_type,
+            iteration_count=next_i,
+            previous_analysis=initial_text,
+            stored_code_definitions=stored_defs,
+            same_context=(task.same_context or current_no_progress),
+            previous_context_amount=len(stored_defs),
+        )
 
 class RepoOps:
     def __init__(self, repo_path: Path | str ) -> None:
@@ -377,6 +545,7 @@ def run():
     parser.add_argument('-l', '--llm', type=str, choices=['claude', 'gpt', 'ollama', 'openrouter'], default='claude', help='LLM client to use (default: claude)')
     parser.add_argument('--restart', action='store_true', help='Start fresh and ignore cached analyses')
     parser.add_argument('-v', '--verbosity', action='count', default=0, help='Increase output verbosity (-v for INFO, -vv for DEBUG)')
+    parser.add_argument('--parallelism', type=int, default=32, help='Max number of parallel tasks to run (default: 32)')
     args = parser.parse_args()
 
     repo = RepoOps(args.root)
@@ -451,12 +620,12 @@ def run():
     llm = initialize_llm(args.llm)
 
     readme_content = repo.get_readme_content()
-    if False:
+    if readme_content:
         log.info("Summarizing project README")
         readme_prompt = (
             ReadmeContent(content=readme_content).to_xml() + b'\n' +
             Instructions(instructions=README_SUMMARY_PROMPT_TEMPLATE).to_xml()
-        ).decode()
+            ).decode()
         summary = llm.chat(readme_prompt)
         summary = extract_between_tags("summary", summary)[0]
         log.info("README summary complete", summary=summary)
@@ -496,139 +665,65 @@ def run():
     secondary_queue: deque[Task] = deque()
     final_findings_path = Path('vulnhuntr_final_findings.jsonl')
 
+    # Initialize async file writers
+    primary_writer = FileWriter(primary_cache_path)
+    secondary_writer = FileWriter(secondary_cache_path)
+    final_writer = FileWriter(final_findings_path)
+    primary_writer.start()
+    secondary_writer.start()
+    final_writer.start()
+
     print(f"Initial files to analyze: {files_to_analyze}")
-    # Phase 1: run all initial analyses first
-    while initial_queue:
-        task = initial_queue.popleft()
-        py_f = Path(task.file_path)
 
-        # Read file content (used by both tasks)
-        try:
-            with py_f.open(encoding='utf-8') as f:
-                content = f.read()
-        except Exception:
-            continue
-        if not content:
-            continue
+    # Phase 1 parallel execution
+    with ThreadPoolExecutor(max_workers=max(1, args.parallelism)) as pool:
+        futures = [
+            pool.submit(
+                process_initial_task,
+                t,
+                primary_writer,
+                llm,
+                primary_map,
+            )
+            for t in list(initial_queue)
+        ]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if res:
+                    secondary_queue.extend(res)
+            except Exception as e:
+                log.error("Initial task failed", exc_info=e)
 
-        if task.type == TaskType.INITIAL:
-            if task.file_path in primary_map:
-                log.info("Skipping already analyzed file", file=task.file_path)
-                continue
-            print(f"\nAnalyzing {py_f}")
-            print('-' * 40 +'\n')
-            user_prompt = (
-                FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
-                Instructions(instructions=INITIAL_ANALYSIS_PROMPT_TEMPLATE).to_xml() + b'\n' +
-                AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
-                PreviousAnalysis(previous_analysis='').to_xml() + b'\n' +
-                Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
-                ResponseFormat(response_format=json.dumps(ResponseInitial.model_json_schema(), indent=4)).to_xml()
-            ).decode()
-            log.info("Initial analysis prompt", user_prompt=user_prompt)
-            initial_analysis_report: ResponseInitial = llm.chat(user_prompt, response_model=ResponseInitial)
-            log.info("Initial analysis complete", report=initial_analysis_report.model_dump())
-            with primary_cache_path.open('a', encoding='utf-8') as f:
-                rec = {"file_path": str(py_f), **initial_analysis_report.model_dump()}
-                f.write(json.dumps(rec) + "\n")
-            primary_map[str(py_f)] = rec
-            print_readable(initial_analysis_report)
-
-            # Enqueue secondary tasks per vulnerability type (skip proto/generated)
-            if initial_analysis_report.confidence_score > 0 and len(initial_analysis_report.vulnerability_types):
-                for vuln_type in initial_analysis_report.vulnerability_types:
-                    if not _is_proto_or_generated(str(py_f)):
-                        secondary_queue.append(Task(
-                            type=TaskType.SECONDARY,
-                            file_path=str(py_f),
-                            vuln_type=vuln_type,
-                            iteration_count=0,
-                            previous_analysis=initial_analysis_report.analysis,
-                        ))
-
-            # Initial analysis should NOT enqueue context requests; only vulnerabilities create secondary tasks
-
-    # Phase 2: run all secondary analyses
+    # Phase 2 parallel execution with waves
     while secondary_queue:
-        task = secondary_queue.popleft()
-        py_f = Path(task.file_path)
-        if not task.vuln_type:
-            continue
-        # Read file content
-        try:
-            with py_f.open(encoding='utf-8') as f:
-                content = f.read()
-        except Exception:
-            continue
-        if not content:
-            continue
-        if task.type == TaskType.SECONDARY:
-            i = task.iteration_count or 0
-            stored_defs = task.stored_code_definitions or {}
-            previous_context_amount = len(stored_defs)
-            definitions = CodeDefinitions(definitions=list(stored_defs.values()))
+        wave = list(secondary_queue)
+        secondary_queue.clear()
+        with ThreadPoolExecutor(max_workers=max(1, args.parallelism)) as pool:
+            futures = [
+                pool.submit(
+                    process_secondary_task,
+                    t,
+                    secondary_writer,
+                    final_writer,
+                    llm,
+                    primary_map,
+                    secondary_map,
+                    code_extractor,
+                    files,
+                )
+                for t in wave
+            ]
+            for fut in as_completed(futures):
+                try:
+                    nxt = fut.result()
+                    if nxt:
+                        secondary_queue.append(nxt)
+                except Exception as e:
+                    log.error("Secondary task failed", exc_info=e)
 
-            # Build vuln-specific prompt including the initial analysis text as previous_analysis
-            initial_text = primary_map.get(str(py_f), {}).get('analysis', '')
-            vuln_specific_user_prompt = (
-                FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
-                definitions.to_xml() + b'\n' +
-                ExampleBypasses(example_bypasses='\n'.join(VULN_SPECIFIC_BYPASSES_AND_PROMPTS[task.vuln_type]['bypasses'])).to_xml() + b'\n' +
-                Instructions(instructions=VULN_SPECIFIC_BYPASSES_AND_PROMPTS[task.vuln_type]['prompt']).to_xml() + b'\n' +
-                AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
-                PreviousAnalysis(previous_analysis=initial_text).to_xml() + b'\n' +
-                Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
-                ResponseFormat(response_format=json.dumps(Response.model_json_schema(), indent=4)).to_xml()
-            ).decode()
-            log.info("Secondary analysis for file and vulnerability type", file=py_f, vuln_type=task.vuln_type)
-            secondary_analysis_report: Response = llm.chat(vuln_specific_user_prompt, response_model=Response)
-            log.info("Secondary analysis complete", secondary_analysis_report=secondary_analysis_report.model_dump())
-            with secondary_cache_path.open('a', encoding='utf-8') as f:
-                rec2 = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
-                f.write(json.dumps(rec2) + "\n")
-            secondary_map.setdefault(str(py_f), {}).setdefault(task.vuln_type, []).append(rec2)
-            if args.verbosity > 0:
-                print_readable(secondary_analysis_report)
-
-            # Update stored definitions with newly requested context
-            added = 0
-            for context_item in secondary_analysis_report.context_code:
-                req_type = context_item.request_type
-                name = context_item.name
-                code_line = context_item.code_line
-                if req_type == 'REQUEST_DEFINITION':
-                    if name not in stored_defs:
-                        match = code_extractor.extract(name, code_line, files)
-                        if match:
-                            stored_defs[name] = match
-                            added += 1
-                            # We no longer enqueue new initial tasks here
-                elif req_type == 'REQUEST_CALLERS':
-                    callers = code_extractor.find_callers(name, list(files))
-                    for caller in callers:
-                        fp = caller['file_path']
-                        # We no longer enqueue new initial tasks here
-
-            # Determine next iteration or finalize
-            next_i = i + 1
-            current_no_progress = (added == 0)
-            finalize_now = (next_i >= 7) or (task.same_context and current_no_progress)
-            if finalize_now:
-                with final_findings_path.open('a', encoding='utf-8') as f:
-                    final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
-                    f.write(json.dumps(final_rec) + "\n")
-                print_readable(secondary_analysis_report)
-            else:
-                secondary_queue.append(Task(
-                    type=TaskType.SECONDARY,
-                    file_path=str(py_f),
-                    vuln_type=task.vuln_type,
-                    iteration_count=next_i,
-                    previous_analysis=initial_text,
-                    stored_code_definitions=stored_defs,
-                    same_context=(task.same_context or current_no_progress),
-                    previous_context_amount=len(stored_defs),
-                ))
+    # Stop writers
+    primary_writer.stop(); secondary_writer.stop(); final_writer.stop()
 
 if __name__ == '__main__':
     run()
