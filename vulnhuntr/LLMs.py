@@ -227,10 +227,10 @@ class LLM:
             return response_text
 
 class Claude(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
+    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
         super().__init__(system_prompt)
-        # API key is retrieved from an environment variable by default
-        self.client = anthropic.Anthropic(max_retries=3, base_url=base_url)
+        # API key can be provided explicitly or via environment variable
+        self.client = anthropic.Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"), max_retries=3, base_url=base_url)
         self.model = model
 
     def create_messages(self, user_prompt: str) -> List[Dict[str, str]]:
@@ -257,9 +257,9 @@ class Claude(LLM):
 
 
 class ChatGPT(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
+    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
         super().__init__(system_prompt)
-        self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=base_url)
+        self.client = openai.OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"), base_url=base_url)
         self.model = model
 
     def create_messages(self, user_prompt: str) -> List[Dict[str, str]]:
@@ -304,7 +304,7 @@ class ChatGPT(LLM):
 
 
 class OpenRouter(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
+    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
         super().__init__(system_prompt)
         default_headers = {}
         # Optional but recommended headers for OpenRouter analytics/rate limits
@@ -314,7 +314,7 @@ class OpenRouter(LLM):
             default_headers["X-Title"] = os.getenv("OPENROUTER_TITLE")
 
         self.client = openai.OpenAI(
-            api_key=os.getenv("OPENROUTER_API_KEY"),
+            api_key=api_key or os.getenv("OPENROUTER_API_KEY"),
             base_url=base_url,
             default_headers=default_headers or None,
         )
@@ -357,7 +357,7 @@ class OpenRouter(LLM):
         return response
 
 class Ollama(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
+    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
         super().__init__(system_prompt)
         self.api_url = base_url
         self.model = model

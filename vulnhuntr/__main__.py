@@ -1,4 +1,5 @@
 import json
+import time
 import re
 import argparse
 import json
@@ -197,7 +198,7 @@ def process_initial_task(task: Task,
     except Exception as e:
         log.error("Primary enqueue failed", exc_info=e)
     primary_map[str(py_f)] = rec
-    print_readable(report)
+    print_readable(str(py_f), report)
     # build secondary tasks
     new_secondaries: list[Task] = []
     if report.confidence_score > 0 and len(report.vulnerability_types):
@@ -288,7 +289,7 @@ def process_secondary_task(task: Task,
             final_writer.enqueue(final_rec)
         except Exception as e:
             log.error("Final enqueue failed", exc_info=e)
-        print_readable(secondary_analysis_report)
+        print_readable(str(py_f), secondary_analysis_report)
         return None
     else:
         return Task(
@@ -494,32 +495,32 @@ def extract_between_tags(tag: str, string: str, strip: bool = False) -> list[str
         ext_list = [e.strip() for e in ext_list]
     return ext_list
 
-def initialize_llm(llm_arg: str, system_prompt: str = "") -> Claude | ChatGPT | Ollama | OpenRouter:
+def initialize_llm(llm_arg: str, system_prompt: str = "", model: str | None = None, base_url: str | None = None, api_key: str | None = None) -> Claude | ChatGPT | Ollama | OpenRouter:
     llm_arg = llm_arg.lower()
     if llm_arg == 'claude':
-        anth_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-        anth_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-        llm = Claude(anth_model, anth_base_url, system_prompt)
+        use_model = model or "claude-3-5-sonnet-latest"
+        use_base = base_url or "https://api.anthropic.com"
+        llm = Claude(use_model, use_base, system_prompt, api_key=api_key)
     elif llm_arg == 'gpt':
-        openai_model = os.getenv("OPENAI_MODEL", "chatgpt-4o-latest")
-        openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        llm = ChatGPT(openai_model, openai_base_url, system_prompt)
+        use_model = model or "chatgpt-4o-latest"
+        use_base = base_url or "https://api.openai.com/v1"
+        llm = ChatGPT(use_model, use_base, system_prompt, api_key=api_key)
     elif llm_arg == 'ollama':
-        ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
-        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api/generate")
-        llm = Ollama(ollama_model, ollama_base_url, system_prompt)
+        use_model = model or "llama3"
+        use_base = base_url or "http://127.0.0.1:11434/api/generate"
+        llm = Ollama(use_model, use_base, system_prompt, api_key=api_key)
     elif llm_arg == 'openrouter':
         # OpenRouter uses the OpenAI-compatible client with a different base_url and API key
-        or_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-        or_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        llm = OpenRouter(or_model, or_base_url, system_prompt)
+        use_model = model or "openai/gpt-5-nano"
+        use_base = "https://openrouter.ai/api/v1"
+        llm = OpenRouter(use_model, use_base, system_prompt, api_key=api_key)
     else:
         raise ValueError(f"Invalid LLM argument: {llm_arg}\nValid options are: claude, gpt, ollama, openrouter")
     return llm
 
-def print_readable(report: Response | ResponseInitial) -> None:
+def print_readable(filename: str, report: Response | ResponseInitial) -> None:
     print("=" * 80)
-    print(f"File: {report.file_path} | RESPONSE TYPE: {type(report).__name__}")
+    print(f"File: {filename} | RESPONSE TYPE: {type(report).__name__}")
     print("=" * 80)
     
     for attr, value in vars(report).items():
@@ -544,6 +545,9 @@ def run():
     parser.add_argument('-r', '--root', type=str, required=True, help='Path to the root directory of the project')
     parser.add_argument('-a', '--analyze', type=str, help='Specific path or file within the project to analyze')
     parser.add_argument('-l', '--llm', type=str, choices=['claude', 'gpt', 'ollama', 'openrouter'], default='claude', help='LLM client to use (default: claude)')
+    parser.add_argument('--model', type=str, help='Model name for the selected LLM provider')
+    parser.add_argument('--base-url', type=str, help='Base URL for the selected LLM provider')
+    parser.add_argument('--api-key', type=str, help='API key for the selected LLM provider')
     parser.add_argument('--restart', action='store_true', help='Start fresh and ignore cached analyses')
     parser.add_argument('-v', '--verbosity', action='count', default=0, help='Increase output verbosity (-v for INFO, -vv for DEBUG)')
     parser.add_argument('--parallelism', type=int, default=32, help='Max number of parallel tasks to run (default: 32)')
@@ -554,9 +558,14 @@ def run():
     # Get repo files that don't include stuff like tests and documentation
     files = repo.get_relevant_py_files()
 
-    # Initialize persistence (primary/secondary separated)
-    primary_cache_path = Path('vulnhuntr_primary.jsonl')
-    secondary_cache_path = Path('vulnhuntr_secondary.jsonl')
+    # Initialize persistence under results/<target_dir>-<timestamp>/
+    target_dir_name = Path(args.root).resolve().name
+    timestamp = str(int(time.time()))
+    results_root = Path('results')
+    run_dir = results_root / f"{target_dir_name}-{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    primary_cache_path = run_dir / 'vulnhuntr_primary.jsonl'
+    secondary_cache_path = run_dir / 'vulnhuntr_secondary.jsonl'
     primary_map: dict[str, dict] = {}
     secondary_map: dict[str, dict[str, list]] = {}
     if args.restart:
@@ -604,7 +613,7 @@ def run():
     else:
         files_to_analyze = deque(str(f) for f in files)
     
-    llm = initialize_llm(args.llm)
+    llm = initialize_llm(args.llm, model=args.model, base_url=args.base_url, api_key=args.api_key)
 
     readme_content = repo.get_readme_content()
     if readme_content:
@@ -625,12 +634,12 @@ def run():
                 ReadmeSummary(readme_summary=summary).to_xml()
                 ).decode()
     
-    llm = initialize_llm(args.llm, system_prompt)
+    llm = initialize_llm(args.llm, system_prompt, model=args.model, base_url=args.base_url, api_key=args.api_key)
 
     # Let the LLM filter out test and generated files from the initial queue
     # Filter out test and generated files using string patterns
     exclude_patterns = [
-        'tests/', 'test_', '_test.py', 'conftest.py', '__pycache__/', 
+        'tests/', 'test_', 'test', '_test.py', 'conftest.py', '__pycache__/', 
         'build/', 'dist/', 'generated/', 'site-packages/', 'migrations/', 
         '_pb2.py', '_pb2_grpc.py'
     ]
@@ -650,7 +659,7 @@ def run():
     # Build phase-specific task queues
     initial_queue: deque[Task] = deque(Task(type=TaskType.INITIAL, file_path=p) for p in files_to_analyze)
     secondary_queue: deque[Task] = deque()
-    final_findings_path = Path('vulnhuntr_final_findings.jsonl')
+    final_findings_path = run_dir / 'vulnhuntr_final_findings.jsonl'
 
     # Initialize async file writers
     primary_writer = FileWriter(primary_cache_path)

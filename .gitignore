@@ -166,3 +166,6 @@ cython_debug/
 # repos
 repos/
 .vscode/launch.json
+
+vulnhuntr_
+results/
