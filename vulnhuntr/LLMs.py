@@ -1,4 +1,6 @@
 import logging
+import json
+import time
 from typing import List, Union, Dict, Any
 from pydantic import BaseModel, ValidationError
 import anthropic
@@ -36,14 +38,138 @@ class LLM:
         self.prev_response: Union[str, None] = None
         self.prefill = None
 
-    def _validate_response(self, response_text: str, response_model: BaseModel) -> BaseModel:
+    def _extract_json_object(self, text: str) -> str | None:
+        if not text:
+            return None
+        start = text.find('{')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i+1]
+        return None
+
+    def _close_json_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        def _set_closed(node: Any) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    # Require closed objects
+                    node["additionalProperties"] = False
+                    # Ensure 'required' includes every key in properties
+                    props = node.get("properties")
+                    if isinstance(props, dict):
+                        node["required"] = list(props.keys())
+                    # Recurse into properties
+                    if isinstance(props, dict):
+                        for v in props.values():
+                            _set_closed(v)
+                # Recurse common schema containers
+                if "items" in node:
+                    _set_closed(node["items"])
+                for key in ("anyOf", "oneOf", "allOf"):
+                    if key in node and isinstance(node[key], list):
+                        for v in node[key]:
+                            _set_closed(v)
+                for defs_key in ("definitions", "$defs"):
+                    if defs_key in node and isinstance(node[defs_key], dict):
+                        for v in node[defs_key].values():
+                            _set_closed(v)
         try:
-            if self.prefill:
-                response_text = self.prefill + response_text
-            return response_model.model_validate_json(response_text)
-        except ValidationError as e:
-            log.warning("[-] Response validation failed\n", exc_info=e)
-            raise LLMError("Validation failed") from e
+            _set_closed(schema)
+        except Exception:
+            pass
+        return schema
+
+    def _strip_code_fences(self, text: str) -> str:
+        if not text:
+            return text
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            # Remove the first line (``` or ```json) and the trailing ```
+            lines = stripped.splitlines()
+            if len(lines) >= 2:
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                return "\n".join(lines).strip()
+        return text
+
+    def _fallback_response(self, response_model: BaseModel, raw_text: str) -> BaseModel:
+        # Provide a minimal valid structure so the pipeline can continue
+        try:
+            return response_model.model_validate({
+                "analysis": (raw_text or ""),
+                "poc": "",
+                "confidence_score": 0,
+                "vulnerability_types": [],
+                "context_code": []
+            })
+        except Exception as e:
+            raise LLMError("Validation failed and fallback construction failed") from e
+
+    def _validate_response(self, response_text: str, response_model: BaseModel) -> BaseModel:
+        # Multiple strategies to coerce into the schema (balanced extraction, direct, loads, naive slice)
+        if self.prefill:
+            response_text = self.prefill + response_text
+        text = self._strip_code_fences(response_text)
+        if not text or not text.strip():
+            raise LLMError("Empty response from model")
+
+        # 1) Prefer complete JSON object outside strings (balanced braces)
+        candidate = self._extract_json_object(text)
+        if candidate:
+            try:
+                return response_model.model_validate_json(candidate)
+            except ValidationError:
+                pass
+
+        # 2) Direct parse of the whole text
+        try:
+            return response_model.model_validate_json(text)
+        except ValidationError:
+            pass
+
+        # 3) JSON.loads the whole text (may be dict or JSON-encoded string)
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                return response_model.model_validate(loaded)
+            if isinstance(loaded, str):
+                return response_model.model_validate_json(loaded)
+        except Exception:
+            pass
+
+        # 4) Naive slice between first '{' and last '}' as a last resort
+        try:
+            first = text.find('{')
+            last = text.rfind('}')
+            if first != -1 and last != -1 and last > first:
+                naive = text[first:last+1]
+                return response_model.model_validate_json(naive)
+        except Exception:
+            pass
+
+        # Could not validate
+        raise LLMError("Validation failed")
             # try:
             #     response_clean_attempt = response_text.split('{', 1)[1]
             #     return response_model.model_validate_json(response_clean_attempt)
@@ -59,10 +185,15 @@ class LLM:
         raise e
 
     def _log_response(self, response: Dict[str, Any]) -> None:
-        usage_info = response.usage.__dict__
-        log.debug("Received chat response", extra={"usage": usage_info})
+        try:
+            usage_info = getattr(response, "usage", None)
+            if usage_info is not None:
+                usage_info = getattr(usage_info, "__dict__", usage_info)
+            log.debug("Received chat response", extra={"usage": usage_info})
+        except Exception:
+            log.debug("Received chat response")
 
-    def chat(self, user_prompt: str, response_model: BaseModel = None, max_tokens: int = 4096) -> Union[BaseModel, str]:
+    def chat(self, user_prompt: str, response_model: BaseModel = None, max_tokens: int = 16000) -> Union[BaseModel, str]:
         self._add_to_history("user", user_prompt)
         messages = self.create_messages(user_prompt)
         response = self.send_message(messages, max_tokens, response_model)
@@ -70,9 +201,30 @@ class LLM:
 
         response_text = self.get_response(response)
         if response_model:
-            response_text = self._validate_response(response_text, response_model) if response_model else response_text
-        self._add_to_history("assistant", response_text)
-        return response_text
+            try:
+                validated = self._validate_response(response_text, response_model)
+            except LLMError:
+                # One-shot reformat attempt: ask the model to reprint as strict JSON
+                try:
+                    reform_prompt = (
+                        "Reprint the following content as valid RFC 8259 JSON ONLY (no prose, no code fences), strictly matching the schema. "
+                        "Escape all quotes (\"), newlines (\\n), and backslashes (\\\\) in string fields.\n\n"
+                        f"Schema:\n{json.dumps(response_model.model_json_schema())}\n\n"
+                        f"Content to reprint as JSON:\n{response_text}"
+                    )
+                    reform_messages = self.create_messages(reform_prompt)
+                    reform_response = self.send_message(reform_messages, max_tokens, response_model)
+                    reform_text = self.get_response(reform_response)
+                    validated = self._validate_response(reform_text, response_model)
+                    response_text = reform_text
+                except Exception:
+                    validated = self._fallback_response(response_model, response_text)
+            # Store the raw assistant text in history, not the model object
+            self._add_to_history("assistant", response_text or "")
+            return validated
+        else:
+            self._add_to_history("assistant", response_text or "")
+            return response_text
 
 class Claude(LLM):
     def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
@@ -91,20 +243,14 @@ class Claude(LLM):
         return messages
 
     def send_message(self, messages: List[Dict[str, str]], max_tokens: int, response_model: BaseModel) -> Dict[str, Any]:
-        try:
-            # response_model is not used here, only in ChatGPT
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=self.system_prompt,
-                messages=messages
-            )
-        except anthropic.APIConnectionError as e:
-            raise APIConnectionError("Server could not be reached") from e
-        except anthropic.RateLimitError as e:
-            raise RateLimitError("Request was rate-limited") from e
-        except anthropic.APIStatusError as e:
-            raise APIStatusError(e.status_code, e.response) from e
+        
+        # response_model is not used here, only in ChatGPT
+        return self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            system=self.system_prompt,
+            messages=messages
+        )        
 
     def get_response(self, response: Dict[str, Any]) -> str:
         return response.content[0].text.replace('\n', '')
@@ -122,33 +268,93 @@ class ChatGPT(LLM):
         return messages
 
     def send_message(self, messages: List[Dict[str, str]], max_tokens: int, response_model=None) -> Dict[str, Any]:
-        try:
-            params = {
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-            }
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
 
-            # Add response format configuration if a model is provided
-            if response_model:
+        # Add response format configuration if a model is provided
+        if response_model:
+            schema = None
+            try:
+                schema = response_model.model_json_schema()
+            except Exception:
+                schema = None
+            if schema:
                 params["response_format"] = {
-                    "type": "json_object"
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "VulnhuntrResponse",
+                        "schema": schema,
+                        "strict": True,
+                    },
                 }
+            else:
+                params["response_format"] = {"type": "json_object"}
+            # Lower temperature to reduce format drift for structured outputs
+            params["temperature"] = 0.2
 
             return self.client.chat.completions.create(**params)
-        except openai.APIConnectionError as e:
-            raise APIConnectionError("The server could not be reached") from e
-        except openai.RateLimitError as e:
-            raise RateLimitError("Request was rate-limited; consider backing off") from e
-        except openai.APIStatusError as e:
-            raise APIStatusError(e.status_code, e.response) from e
-        except Exception as e:
-            raise LLMError(f"An unexpected error occurred: {str(e)}") from e
+
 
     def get_response(self, response: Dict[str, Any]) -> str:
         response = response.choices[0].message.content
         return response
 
+
+class OpenRouter(LLM):
+    def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
+        super().__init__(system_prompt)
+        default_headers = {}
+        # Optional but recommended headers for OpenRouter analytics/rate limits
+        if os.getenv("OPENROUTER_REFERRER"):
+            default_headers["HTTP-Referer"] = os.getenv("OPENROUTER_REFERRER")
+        if os.getenv("OPENROUTER_TITLE"):
+            default_headers["X-Title"] = os.getenv("OPENROUTER_TITLE")
+
+        self.client = openai.OpenAI(
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            base_url=base_url,
+            default_headers=default_headers or None,
+        )
+        self.model = model
+
+    def create_messages(self, user_prompt: str) -> List[Dict[str, str]]:
+        messages = [{"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_prompt}]
+        return messages
+
+    def send_message(self, messages: List[Dict[str, str]], max_tokens: int, response_model=None) -> Dict[str, Any]:
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if response_model:
+            schema = None
+            try:
+                schema = response_model.model_json_schema()
+            except Exception:
+                schema = None
+            if schema:
+                closed = self._close_json_schema(schema)
+                params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "VulnhuntrResponse",
+                        "schema": closed,
+                        "strict": True,
+                    },
+                }
+            else:
+                params["response_format"] = {"type": "json_object"}
+            params["temperature"] = 0.2
+        return self.client.chat.completions.create(**params)
+
+    def get_response(self, response: Dict[str, Any]) -> str:
+        response = response.choices[0].message.content
+        return response
 
 class Ollama(LLM):
     def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:

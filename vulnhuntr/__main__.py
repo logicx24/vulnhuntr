@@ -1,12 +1,15 @@
 import json
 import re
 import argparse
+import json
+import os
+from collections import deque
 import structlog
 from vulnhuntr.symbol_finder import SymbolExtractor
-from vulnhuntr.LLMs import Claude, ChatGPT, Ollama
+from vulnhuntr.LLMs import Claude, ChatGPT, Ollama, OpenRouter
 from vulnhuntr.prompts import *
 from rich import print
-from typing import List, Generator
+from typing import List, Generator, Literal
 from enum import Enum
 from pathlib import Path
 from pydantic_xml import BaseXmlModel, element
@@ -40,17 +43,24 @@ class VulnType(str, Enum):
     IDOR = "IDOR"
 
 class ContextCode(BaseModel):
-    name: str = Field(description="Function or Class name")
-    reason: str = Field(description="Brief reason why this function's code is needed for analysis")
-    code_line: str = Field(description="The single line of code where where this context object is referenced.")
+    name: str = Field(description="Function, method, class, or module name to request")
+    symbol_kind: str = Field(description="One of: function, method, class, module")
+    request_type: Literal["REQUEST_DEFINITION", "REQUEST_CALLERS"] = Field(description="REQUEST_DEFINITION to fetch the symbol's definition; REQUEST_CALLERS to fetch its callers")
+    reason: str = Field(description="Brief reason why this context is needed for analysis")
+    code_line: str = Field(description="A representative line where this symbol is referenced or called (used as an anchor)")
 
 class Response(BaseModel):
-    scratchpad: str = Field(description="Your step-by-step analysis process. Output in plaintext with no line breaks.")
-    analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.")
+    analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.", min_length=64)
     poc: str = Field(description="Proof-of-concept exploit, if applicable.")
     confidence_score: int = Field(description="0-10, where 0 is no confidence and 10 is absolute certainty because you have the entire user input to server output code path.")
     vulnerability_types: List[VulnType] = Field(description="The types of identified vulnerabilities")
     context_code: List[ContextCode] = Field(description="List of context code items requested for analysis, one function or class name per item. No standard library or third-party package code.")
+
+class ResponseInitial(BaseModel):
+    analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.", min_length=64)
+    poc: str = Field(description="Proof-of-concept exploit, if applicable.")
+    confidence_score: int = Field(description="0-10, where 0 is no confidence and 10 is absolute certainty because you have the entire user input to server output code path.")
+    vulnerability_types: List[VulnType] = Field(description="The types of identified vulnerabilities")
 
 class ReadmeContent(BaseXmlModel, tag="readme_content"):
     content: str
@@ -77,6 +87,9 @@ class FileCode(BaseXmlModel, tag="file_code"):
 class PreviousAnalysis(BaseXmlModel, tag="previous_analysis"):
     previous_analysis: str
 
+class InitialAnalysis(BaseXmlModel, tag="initial_analysis"):
+    initial_analysis: str
+
 class ExampleBypasses(BaseXmlModel, tag="example_bypasses"):
     example_bypasses: str
 
@@ -88,6 +101,37 @@ class CodeDefinition(BaseXmlModel, tag="code"):
 
 class CodeDefinitions(BaseXmlModel, tag="context_code"):
     definitions: List[CodeDefinition] = []
+
+class FileFilterResult(BaseModel):
+    keep: List[str] = Field(description="Absolute file paths to keep for analysis after excluding tests and generated code")
+    drop: List[str] = Field(default_factory=list, description="Absolute file paths excluded as tests or generated code")
+
+class TaskType(str, Enum):
+    INITIAL = "initial"
+    SECONDARY = "secondary"
+
+class Task(BaseModel):
+    type: TaskType
+    file_path: str
+    vuln_type: str | None = None
+    iteration_count: int = 0
+    previous_analysis: str = ""
+    all_previous_analyses: List[str] = Field(default_factory=list)
+    stored_code_definitions: dict = {}
+    same_context: bool = False
+    previous_context_amount: int = 0
+
+    
+def _is_proto_or_generated(path: str) -> bool:
+    pl = path.lower()
+    name = Path(path).name.lower()
+    return (
+        name.endswith('.proto') or
+        name.endswith('_pb2.py') or
+        name.endswith('_pb2_grpc.py') or
+        '/generated/' in pl or
+        '\\generated\\' in pl
+    )
 
 class RepoOps:
     def __init__(self, repo_path: Path | str ) -> None:
@@ -281,7 +325,7 @@ def extract_between_tags(tag: str, string: str, strip: bool = False) -> list[str
         ext_list = [e.strip() for e in ext_list]
     return ext_list
 
-def initialize_llm(llm_arg: str, system_prompt: str = "") -> Claude | ChatGPT | Ollama:
+def initialize_llm(llm_arg: str, system_prompt: str = "") -> Claude | ChatGPT | Ollama | OpenRouter:
     llm_arg = llm_arg.lower()
     if llm_arg == 'claude':
         anth_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
@@ -295,11 +339,20 @@ def initialize_llm(llm_arg: str, system_prompt: str = "") -> Claude | ChatGPT | 
         ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
         ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api/generate")
         llm = Ollama(ollama_model, ollama_base_url, system_prompt)
+    elif llm_arg == 'openrouter':
+        # OpenRouter uses the OpenAI-compatible client with a different base_url and API key
+        or_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+        or_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        llm = OpenRouter(or_model, or_base_url, system_prompt)
     else:
-        raise ValueError(f"Invalid LLM argument: {llm_arg}\nValid options are: claude, gpt, ollama")
+        raise ValueError(f"Invalid LLM argument: {llm_arg}\nValid options are: claude, gpt, ollama, openrouter")
     return llm
 
-def print_readable(report: Response) -> None:
+def print_readable(report: Response | ResponseInitial) -> None:
+    print("=" * 80)
+    print(f"RESPONSE TYPE: {type(report).__name__}")
+    print("=" * 80)
+    
     for attr, value in vars(report).items():
         print(f"{attr}:")
         if isinstance(value, str):
@@ -318,10 +371,11 @@ def print_readable(report: Response) -> None:
         print()  # Add an empty line between attributes
 
 def run():
-    parser = argparse.ArgumentParser(description='Analyze a GitHub project for vulnerabilities. Export your ANTHROPIC_API_KEY/OPENAI_API_KEY before running.')
+    parser = argparse.ArgumentParser(description='Analyze a GitHub project for vulnerabilities. Export your ANTHROPIC_API_KEY/OPENAI_API_KEY or OPENROUTER_API_KEY before running.')
     parser.add_argument('-r', '--root', type=str, required=True, help='Path to the root directory of the project')
     parser.add_argument('-a', '--analyze', type=str, help='Specific path or file within the project to analyze')
-    parser.add_argument('-l', '--llm', type=str, choices=['claude', 'gpt', 'ollama'], default='claude', help='LLM client to use (default: claude)')
+    parser.add_argument('-l', '--llm', type=str, choices=['claude', 'gpt', 'ollama', 'openrouter'], default='claude', help='LLM client to use (default: claude)')
+    parser.add_argument('--restart', action='store_true', help='Start fresh and ignore cached analyses')
     parser.add_argument('-v', '--verbosity', action='count', default=0, help='Increase output verbosity (-v for INFO, -vv for DEBUG)')
     args = parser.parse_args()
 
@@ -330,6 +384,38 @@ def run():
     # Get repo files that don't include stuff like tests and documentation
     files = repo.get_relevant_py_files()
 
+    # Initialize persistence (primary/secondary separated)
+    primary_cache_path = Path('vulnhuntr_primary.jsonl')
+    secondary_cache_path = Path('vulnhuntr_secondary.jsonl')
+    primary_map: dict[str, dict] = {}
+    secondary_map: dict[str, dict[str, list]] = {}
+    if args.restart:
+        if primary_cache_path.exists():
+            primary_cache_path.unlink()
+        if secondary_cache_path.exists():
+            secondary_cache_path.unlink()
+    else:
+        if primary_cache_path.exists():
+            with primary_cache_path.open('r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        primary_map[rec['file_path']] = rec
+                    except Exception:
+                        continue
+        if secondary_cache_path.exists():
+            with secondary_cache_path.open('r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        fp = rec.get('file_path')
+                        vt = rec.get('vuln_type')
+                        if not fp or not vt:
+                            continue
+                        secondary_map.setdefault(fp, {}).setdefault(vt, []).append(rec)
+                    except Exception:
+                        continue
+
     # User specified --analyze flag
     if args.analyze:
         # Determine the path to analyze
@@ -337,24 +423,41 @@ def run():
 
         # If the path is absolute, use it as is, otherwise join it with the root path so user can specify relative paths
         if analyze_path.is_absolute():
-            files_to_analyze = repo.get_files_to_analyze(analyze_path)
+            path_to_analyze = analyze_path
         else:
-            files_to_analyze = repo.get_files_to_analyze(Path(args.root) / analyze_path)
+            path_to_analyze = Path(args.root) / analyze_path
 
-    # Analyze the entire project for network-related files
+        # Always build a deque of files
+        files_to_analyze = deque(str(p) for p in repo.get_files_to_analyze(path_to_analyze))
+
+    # Analyze the entire project guided by static scan and queue
     else:
-        files_to_analyze = repo.get_network_related_files(files)
+        # 1) Static scan to seed initial set
+        log.info("Running static bypass scan over repository")
+        scan_hits = code_extractor.static_bypass_scan(list(files))
+        prioritized_files = []
+        seen_files = set()
+        for hit in scan_hits:
+            fp = hit['file_path']
+            if fp not in seen_files:
+                prioritized_files.append(fp)
+                seen_files.add(fp)
+        # Fallback: if nothing matched, use network-related heuristics
+        if not prioritized_files:
+            prioritized_files = [str(f) for f in repo.get_network_related_files(files)]
+
+        files_to_analyze = deque(prioritized_files)
     
     llm = initialize_llm(args.llm)
 
     readme_content = repo.get_readme_content()
-    if readme_content:
+    if False:
         log.info("Summarizing project README")
-        summary = llm.chat(
-            (ReadmeContent(content=readme_content).to_xml() + b'\n' +
+        readme_prompt = (
+            ReadmeContent(content=readme_content).to_xml() + b'\n' +
             Instructions(instructions=README_SUMMARY_PROMPT_TEMPLATE).to_xml()
-            ).decode()
-        )
+        ).decode()
+        summary = llm.chat(readme_prompt)
         summary = extract_between_tags("summary", summary)[0]
         log.info("README summary complete", summary=summary)
     else:
@@ -368,122 +471,164 @@ def run():
     
     llm = initialize_llm(args.llm, system_prompt)
 
-    # files_to_analyze is either a list of all network-related files or a list containing a single file/dir to analyze
-    for py_f in files_to_analyze:
-        log.info(f"Performing initial analysis", file=str(py_f))
+    # Let the LLM filter out test and generated files from the initial queue
+    # Filter out test and generated files using string patterns
+    exclude_patterns = [
+        'tests/', 'test_', '_test.py', 'conftest.py', '__pycache__/', 
+        'build/', 'dist/', 'generated/', 'site-packages/', 'migrations/', 
+        '_pb2.py', '_pb2_grpc.py'
+    ]
+    
+    filtered_files = []
+    for file_path in files_to_analyze:
+        should_exclude = False
+        for pattern in exclude_patterns:
+            if pattern in file_path:
+                should_exclude = True
+                break
+        if not should_exclude:
+            filtered_files.append(file_path)
+    
+    files_to_analyze = deque(filtered_files)
 
-        # This is the Initial analysis
-        with py_f.open(encoding='utf-8') as f:
-            content = f.read()
-            if not len(content):
+    # Build phase-specific task queues
+    initial_queue: deque[Task] = deque(Task(type=TaskType.INITIAL, file_path=p) for p in files_to_analyze)
+    secondary_queue: deque[Task] = deque()
+    final_findings_path = Path('vulnhuntr_final_findings.jsonl')
+
+    print(f"Initial files to analyze: {files_to_analyze}")
+    # Phase 1: run all initial analyses first
+    while initial_queue:
+        task = initial_queue.popleft()
+        py_f = Path(task.file_path)
+
+        # Read file content (used by both tasks)
+        try:
+            with py_f.open(encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+        if not content:
+            continue
+
+        if task.type == TaskType.INITIAL:
+            if task.file_path in primary_map:
+                log.info("Skipping already analyzed file", file=task.file_path)
                 continue
-
             print(f"\nAnalyzing {py_f}")
             print('-' * 40 +'\n')
-
-            user_prompt =(
-                    FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
-                    Instructions(instructions=INITIAL_ANALYSIS_PROMPT_TEMPLATE).to_xml() + b'\n' +
-                    AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
-                    PreviousAnalysis(previous_analysis='').to_xml() + b'\n' +
-                    Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
-                    ResponseFormat(response_format=json.dumps(Response.model_json_schema(), indent=4
-                    )
-                ).to_xml()
+            user_prompt = (
+                FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
+                Instructions(instructions=INITIAL_ANALYSIS_PROMPT_TEMPLATE).to_xml() + b'\n' +
+                AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
+                PreviousAnalysis(previous_analysis='').to_xml() + b'\n' +
+                Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
+                ResponseFormat(response_format=json.dumps(ResponseInitial.model_json_schema(), indent=4)).to_xml()
             ).decode()
-
-            initial_analysis_report: Response = llm.chat(user_prompt, response_model=Response)
+            log.info("Initial analysis prompt", user_prompt=user_prompt)
+            initial_analysis_report: ResponseInitial = llm.chat(user_prompt, response_model=ResponseInitial)
             log.info("Initial analysis complete", report=initial_analysis_report.model_dump())
-
+            with primary_cache_path.open('a', encoding='utf-8') as f:
+                rec = {"file_path": str(py_f), **initial_analysis_report.model_dump()}
+                f.write(json.dumps(rec) + "\n")
+            primary_map[str(py_f)] = rec
             print_readable(initial_analysis_report)
 
-            # Secondary analysis
+            # Enqueue secondary tasks per vulnerability type (skip proto/generated)
             if initial_analysis_report.confidence_score > 0 and len(initial_analysis_report.vulnerability_types):
-
                 for vuln_type in initial_analysis_report.vulnerability_types:
+                    if not _is_proto_or_generated(str(py_f)):
+                        secondary_queue.append(Task(
+                            type=TaskType.SECONDARY,
+                            file_path=str(py_f),
+                            vuln_type=vuln_type,
+                            iteration_count=0,
+                            previous_analysis=initial_analysis_report.analysis,
+                        ))
 
-                    # Do not fetch the context code on the first pass of the secondary analysis because the context will be from the general analysis
-                    stored_code_definitions = {}
-                    definitions = CodeDefinitions(definitions=[])
-                    same_context = False
+            # Initial analysis should NOT enqueue context requests; only vulnerabilities create secondary tasks
 
-                    # Don't include the initial analysis or the first iteration of the secondary analysis in the user_prompt
-                    previous_analysis = ''
-                    previous_context_amount = 0
+    # Phase 2: run all secondary analyses
+    while secondary_queue:
+        task = secondary_queue.popleft()
+        py_f = Path(task.file_path)
+        if not task.vuln_type:
+            continue
+        # Read file content
+        try:
+            with py_f.open(encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+        if not content:
+            continue
+        if task.type == TaskType.SECONDARY:
+            i = task.iteration_count or 0
+            stored_defs = task.stored_code_definitions or {}
+            previous_context_amount = len(stored_defs)
+            definitions = CodeDefinitions(definitions=list(stored_defs.values()))
 
-                    for i in range(7):
-                        log.info(f"Performing vuln-specific analysis", iteration=i, vuln_type=vuln_type, file=py_f)
+            # Build vuln-specific prompt including the initial analysis text as previous_analysis
+            initial_text = primary_map.get(str(py_f), {}).get('analysis', '')
+            vuln_specific_user_prompt = (
+                FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
+                definitions.to_xml() + b'\n' +
+                ExampleBypasses(example_bypasses='\n'.join(VULN_SPECIFIC_BYPASSES_AND_PROMPTS[task.vuln_type]['bypasses'])).to_xml() + b'\n' +
+                Instructions(instructions=VULN_SPECIFIC_BYPASSES_AND_PROMPTS[task.vuln_type]['prompt']).to_xml() + b'\n' +
+                AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
+                PreviousAnalysis(previous_analysis=initial_text).to_xml() + b'\n' +
+                Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
+                ResponseFormat(response_format=json.dumps(Response.model_json_schema(), indent=4)).to_xml()
+            ).decode()
+            log.info("Secondary analysis for file and vulnerability type", file=py_f, vuln_type=task.vuln_type)
+            secondary_analysis_report: Response = llm.chat(vuln_specific_user_prompt, response_model=Response)
+            log.info("Secondary analysis complete", secondary_analysis_report=secondary_analysis_report.model_dump())
+            with secondary_cache_path.open('a', encoding='utf-8') as f:
+                rec2 = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
+                f.write(json.dumps(rec2) + "\n")
+            secondary_map.setdefault(str(py_f), {}).setdefault(task.vuln_type, []).append(rec2)
+            if args.verbosity > 0:
+                print_readable(secondary_analysis_report)
 
-                        # Only lookup context code and previous analysis on second pass and onwards
-                        if i > 0:
-                            previous_context_amount = len(stored_code_definitions)
-                            previous_analysis = secondary_analysis_report.analysis
+            # Update stored definitions with newly requested context
+            added = 0
+            for context_item in secondary_analysis_report.context_code:
+                req_type = context_item.request_type
+                name = context_item.name
+                code_line = context_item.code_line
+                if req_type == 'REQUEST_DEFINITION':
+                    if name not in stored_defs:
+                        match = code_extractor.extract(name, code_line, files)
+                        if match:
+                            stored_defs[name] = match
+                            added += 1
+                            # We no longer enqueue new initial tasks here
+                elif req_type == 'REQUEST_CALLERS':
+                    callers = code_extractor.find_callers(name, list(files))
+                    for caller in callers:
+                        fp = caller['file_path']
+                        # We no longer enqueue new initial tasks here
 
-                            for context_item in secondary_analysis_report.context_code:
-                                # Make sure bot isn't requesting the same code multiple times
-                                if context_item.name not in stored_code_definitions:
-                                    name = context_item.name
-                                    code_line = context_item.code_line
-                                    match = code_extractor.extract(name, code_line, files)
-                                    if match:
-                                        stored_code_definitions[name] = match
-
-                            code_definitions = list(stored_code_definitions.values())
-                            definitions = CodeDefinitions(definitions=code_definitions)
-                            
-                            if args.verbosity > 1:
-                                for definition in definitions.definitions:
-                                    if '\n' in definition.source:
-                                        lines = definition.source.split('\n')
-                                        snippet = lines[0] + '\n' + lines[1]
-                                    else:
-                                        snippet = definition.source[:75]
-                                    
-                                    print(f"Name: {definition.name}")
-                                    print(f"Context search: {definition.context_name_requested}")
-                                    print(f"File Path: {definition.file_path}")
-                                    print(f"First two lines from source: {snippet}\n")
-
-                        vuln_specific_user_prompt = (
-                            FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
-                            definitions.to_xml() + b'\n' +  # These are all the requested context functions and classes
-                            ExampleBypasses(
-                                example_bypasses='\n'.join(VULN_SPECIFIC_BYPASSES_AND_PROMPTS[vuln_type]['bypasses'])
-                            ).to_xml() + b'\n' +
-                            Instructions(instructions=VULN_SPECIFIC_BYPASSES_AND_PROMPTS[vuln_type]['prompt']).to_xml() + b'\n' +
-                            AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
-                            PreviousAnalysis(previous_analysis=previous_analysis).to_xml() + b'\n' +
-                            Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
-                            ResponseFormat(
-                                response_format=json.dumps(
-                                    Response.model_json_schema(), indent=4
-                                )
-                            ).to_xml()
-                        ).decode()
-
-                        secondary_analysis_report: Response = llm.chat(vuln_specific_user_prompt, response_model=Response)
-                        log.info("Secondary analysis complete", secondary_analysis_report=secondary_analysis_report.model_dump())
-
-                        if args.verbosity > 0:
-                            print_readable(secondary_analysis_report)
-
-                        if not len(secondary_analysis_report.context_code):
-                            log.debug("No new context functions or classes found")
-                            if args.verbosity == 0:
-                                print_readable(secondary_analysis_report)
-                            break
-                        
-                        # Check if any new context code is requested
-                        if previous_context_amount >= len(stored_code_definitions) and i > 0:
-                            # Let it request the same context once, then on the second time it requests the same context, break
-                            if same_context:
-                                log.debug("No new context functions or classes requested")
-                                if args.verbosity == 0:
-                                    print_readable(secondary_analysis_report)
-                                break
-                            same_context = True
-                            log.debug("No new context functions or classes requested")
-                    pass
+            # Determine next iteration or finalize
+            next_i = i + 1
+            current_no_progress = (added == 0)
+            finalize_now = (next_i >= 7) or (task.same_context and current_no_progress)
+            if finalize_now:
+                with final_findings_path.open('a', encoding='utf-8') as f:
+                    final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
+                    f.write(json.dumps(final_rec) + "\n")
+                print_readable(secondary_analysis_report)
+            else:
+                secondary_queue.append(Task(
+                    type=TaskType.SECONDARY,
+                    file_path=str(py_f),
+                    vuln_type=task.vuln_type,
+                    iteration_count=next_i,
+                    previous_analysis=initial_text,
+                    stored_code_definitions=stored_defs,
+                    same_context=(task.same_context or current_no_progress),
+                    previous_context_amount=len(stored_defs),
+                ))
 
 if __name__ == '__main__':
     run()

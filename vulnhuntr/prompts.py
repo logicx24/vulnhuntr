@@ -290,7 +290,7 @@ VULN_SPECIFIC_BYPASSES_AND_PROMPTS = {
 }
 
 INITIAL_ANALYSIS_PROMPT_TEMPLATE = """
-Analyze the code in <file_code> tags for potential remotely exploitable vulnerabilities:
+Analyze the code in <file_code> for potential remotely exploitable vulnerabilities. Be concise. Do NOT request context in this pass. Your goal is to identify concrete vulnerability candidates and seed follow-up tasks:
 1. Identify all remote user input entry points (e.g., API endpoints, form submissions) and if you can't find that, request the necessary classes or functions in the <context_code> tags.
 2. Locate potential vulnerability sinks for:
    - Local File Inclusion (LFI)
@@ -301,9 +301,17 @@ Analyze the code in <file_code> tags for potential remotely exploitable vulnerab
    - SQL Injection (SQLI)
    - Insecure Direct Object Reference (IDOR)
 3. Note any security controls or sanitization measures encountered along the way so you can craft bypass techniques for the proof of concept (PoC).
-4. Highlight areas where more context is needed to complete the analysis.
+4. Instead of requesting context in this pass, list the vulnerability candidates you want to investigate in follow-up, and the symbols that are likely relevant (functions/classes/methods/modules). The system will schedule a follow-up iteration per vulnerability.
+
+Important exclusions:
+- Ignore test files and directories (e.g., tests/, test_*, *_test.py, conftest.py)
+- Ignore generated or build artifacts (e.g., __pycache__/, build/, dist/, generated/, site-packages/, migrations/, *_pb2.py, *_pb2_grpc.py)
 
 Be generous and thorough in identifying potential vulnerabilities as you'll analyze more code in subsequent steps so if there's just a possibility of a vulnerability, include it the <vulnerability_types> tags.
+
+Examples of follow-up symbols (do NOT request in this pass):
+ - load_user (function) — to inspect definition
+ - parse_request (function) — to inspect callers
 """
 
 README_SUMMARY_PROMPT_TEMPLATE = """
@@ -322,6 +330,8 @@ GUIDELINES_TEMPLATE = """Reporting Guidelines:
    - Provide a single, well-formed JSON report combining all findings.
    - Use 'None' for any aspect of the report that you lack the necessary information for.
    - Place your step-by-step analysis in the scratchpad field, before doing a final analysis in the analysis field.
+   - Important: Do NOT wrap the JSON in quotes, markdown code fences, or any additional text. Output ONLY raw JSON.
+   - Do NOT return JSON nested inside a string. The top-level output must be a JSON object matching the schema.
 
 2. Context Requests:
    - Classes: Use ClassName1,ClassName2
@@ -341,7 +351,7 @@ GUIDELINES_TEMPLATE = """Reporting Guidelines:
    - Review the code path ofthe potential vulnerability and be sure that the PoC bypasses any security controls in the code path.
 """
 
-ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions:
+ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
 1. Comprehensive Review:
    - Thoroughly examine the content in <file_code>, <context_code> tags (if provided) with a focus on remotely exploitable vulnerabilities.
 
@@ -361,7 +371,15 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions:
 
 6. Context-Aware Analysis:
    - If this is a follow-up analysis, build upon previous findings in <previous_analysis> using the new information provided in the <context_code>.
-   - Request additional context code as needed to complete the analysis and you will be provided with the necessary code.
+   - In follow-up iterations you may request additional context. Use structured context_code entries with the following fields for each item:
+     - name: symbol name (function, method, class, or module)
+     - symbol_kind: one of function|method|class|module
+     - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
+     - reason: brief justification
+     - code_line: an anchor line where the symbol is referenced
+   - Example requests:
+     - {"name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow", "code_line": "user = load_user(uid)"}
+     - {"name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input", "code_line": "parse_request(req)"}
    - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
 
 7. Final Review:

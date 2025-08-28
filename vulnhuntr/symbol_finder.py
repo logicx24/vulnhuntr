@@ -1,7 +1,9 @@
 import jedi
 import pathlib
+import re
 from typing import List, Dict, Any
 from jedi.api.classes import Name
+from vulnhuntr.prompts import VULN_SPECIFIC_BYPASSES_AND_PROMPTS
 
 
 class SymbolExtractor:
@@ -10,6 +12,7 @@ class SymbolExtractor:
         self.project = jedi.Project(self.repo_path)
         self.parsed_symbols = None
         self.ignore = ['/test', '_test/', '/docs', '/example']
+        self._script_cache: Dict[str, jedi.Script] = {}
     
     def extract(self, symbol_name: str, code_line: str, filtered_files: List) -> Dict:
         """
@@ -54,6 +57,97 @@ class SymbolExtractor:
 
         return match
     
+    def _get_script(self, file: pathlib.Path) -> jedi.Script:
+        key = str(file)
+        if key not in self._script_cache:
+            self._script_cache[key] = jedi.Script(path=file, project=self.project)
+        return self._script_cache[key]
+
+    def get_enclosing_symbol(self, file_path: pathlib.Path, line_no: int) -> Dict[str, Any] | None:
+        """Return the smallest enclosing function or class containing line_no in file_path."""
+        try:
+            script = self._get_script(file_path)
+            names = script.get_names(all_scopes=True, definitions=True)
+        except Exception:
+            return None
+
+        best = None
+        best_span = None
+        for name in names:
+            if name.type not in ['function', 'class']:
+                continue
+            try:
+                start = name.get_definition_start_position()
+                end = name.get_definition_end_position()
+            except Exception:
+                continue
+            if not start or not end:
+                continue
+            if start[0] <= line_no <= end[0]:
+                span = (end[0] - start[0])
+                if best_span is None or span < best_span:
+                    best_span = span
+                    best = {"name": name.name, "type": name.type, "start": start, "end": end}
+        return best
+
+    def static_bypass_scan(self, files: List[pathlib.Path]) -> List[Dict[str, Any]]:
+        """
+        Build regexes from VULN_SPECIFIC_BYPASSES_AND_PROMPTS and scan files for matches.
+        Returns a list of hits with vuln_type, file_path, line_no, line_text, pattern, enclosing symbol.
+        """
+        compiled: Dict[str, List[Dict[str, Any]]] = {}
+        for vuln_type, cfg in VULN_SPECIFIC_BYPASSES_AND_PROMPTS.items():
+            patterns = []
+            for ex in cfg.get('bypasses', []):
+                if not ex:
+                    continue
+                try:
+                    pat = re.compile(re.escape(ex), re.IGNORECASE)
+                except re.error:
+                    continue
+                patterns.append({"example": ex, "pattern": pat})
+            compiled[vuln_type] = patterns
+
+        results: List[Dict[str, Any]] = []
+        for file in files:
+            try:
+                with file.open(encoding='utf-8') as f:
+                    for idx, line in enumerate(f, start=1):
+                        for vuln_type, plist in compiled.items():
+                            for entry in plist:
+                                if entry["pattern"].search(line):
+                                    encl = self.get_enclosing_symbol(file, idx)
+                                    results.append({
+                                        "vuln_type": vuln_type,
+                                        "file_path": str(file),
+                                        "line_no": idx,
+                                        "line_text": line.rstrip('\n'),
+                                        "pattern": entry["example"],
+                                        "enclosing": encl,
+                                    })
+            except (UnicodeDecodeError, OSError):
+                continue
+        return results
+
+    def find_callers(self, symbol_name: str, files: List[pathlib.Path]) -> List[Dict[str, Any]]:
+        """
+        Naive cross-repo caller search for a function/method name.
+        Returns list with file_path, line_no, line_text, kind (direct|method).
+        """
+        direct = re.compile(r"\b" + re.escape(symbol_name) + r"\s*\(")
+        method = re.compile(r"\." + re.escape(symbol_name) + r"\s*\(")
+        results: List[Dict[str, Any]] = []
+        for file in files:
+            try:
+                with file.open(encoding='utf-8') as f:
+                    for idx, line in enumerate(f, start=1):
+                        if direct.search(line):
+                            results.append({"file_path": str(file), "line_no": idx, "line_text": line.rstrip('\n'), "kind": "direct"})
+                        elif method.search(line):
+                            results.append({"file_path": str(file), "line_no": idx, "line_text": line.rstrip('\n'), "kind": "method"})
+            except (UnicodeDecodeError, OSError):
+                continue
+        return results
     def file_search(self, symbol_name: str, scripts: List) -> Dict[str, Any]:
         # Analyze matching files with Jedi
         for script in scripts:
