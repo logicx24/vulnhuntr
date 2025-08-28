@@ -1,7 +1,10 @@
 import jedi
 import pathlib
 import re
-from typing import List, Dict, Any
+import importlib
+import inspect
+import sysconfig
+from typing import List, Dict, Any, Optional
 from jedi.api.classes import Name
 from vulnhuntr.prompts import VULN_SPECIFIC_BYPASSES_AND_PROMPTS
 
@@ -14,7 +17,12 @@ class SymbolExtractor:
         self.ignore = ['/test', '_test/', '/docs', '/example']
         self._script_cache: Dict[str, jedi.Script] = {}
     
-    def extract(self, symbol_name: str, code_line: str, filtered_files: List) -> Dict:
+    def extract(self,
+                module_name: str,
+                class_name: Optional[str],
+                entity_name: str,
+                symbol_kind: str,
+                filtered_files: List) -> Dict:
         """
         Extracts the definition of a symbol from the repository.
 
@@ -33,29 +41,180 @@ class SymbolExtractor:
                     The code_line is in the description. 
         """
 
-        symbol_parts = symbol_name.split('.')
-        matching_files = [file for file in filtered_files if self._search_string_in_file(file, code_line)]
-        if len(matching_files) == 0:
-            print(f'Code line not found: {code_line}')
-            scripts = []
-        else:
-            scripts = [jedi.Script(path=file, project=self.project) for file in matching_files]
+        # Normalize module/class by handling cases where module_name includes a trailing class
+        norm_module, norm_class = self._resolve_module_and_class(module_name, class_name)
+
+        # If this appears to be a stdlib or builtin reference, surface stdlib info
+        stdlib_info = self._stdlib_definition_info(norm_module, norm_class, entity_name, symbol_kind)
+        if stdlib_info:
+            return stdlib_info
+
+        # Build script list from files under module_name path hint
+        scripts: List[jedi.Script] = []
+        for file in filtered_files:
+            fstr = str(file)
+            if norm_module.replace('.', '/') in fstr.replace('\\', '/'):
+                try:
+                    scripts.append(jedi.Script(path=file, project=self.project))
+                except Exception:
+                    continue
+        # If no scripts matched the module hint, fall back to scanning all files
+        if not scripts:
+            for file in filtered_files:
+                try:
+                    scripts.append(jedi.Script(path=file, project=self.project))
+                except Exception:
+                    continue
 
         
         # Search using jedi.Script.search; uses the code_line from bot to grep for string in files
-        match = self.file_search(symbol_name, scripts)
+        search_token = entity_name if not norm_class else (entity_name if symbol_kind == 'function' else norm_class)
+        match = self.file_search(search_token, scripts)
         if match:
             return match
 
         # Search using jedi.Project.search(); finds matches and class instance variables like "var = ClassName(); var.method()"
-        match = self.project_search(symbol_name)
+        match = self.project_search(search_token)
         if match:
             return match
         
         # Still no match, so we search using jedi.Script.get_names(); handles method calls on variables
-        match = self.all_names_search(symbol_name, symbol_parts, scripts, code_line)
+        symbol_parts = (f"{norm_class}.{entity_name}" if norm_class else entity_name).split('.')
+        match = self.all_names_search(search_token, symbol_parts, scripts, '')
+        if match:
+            return match
 
-        return match
+        # Final fallback: regex-based definition search
+        rx_match = self._regex_definition_search(entity_name, symbol_kind, filtered_files)
+        if rx_match:
+            return rx_match
+
+        # Nothing found: return a sentinel to inform the model
+        return {
+            'name': entity_name if symbol_kind == 'function' else (norm_class or entity_name),
+            'context_name_requested': f"{norm_module}.{norm_class + '.' if norm_class else ''}{entity_name}",
+            'file_path': 'NOT_FOUND',
+            'source': (
+                "NOT_FOUND: Symbol not found in repository. Please refine module_name/class_name/entity_name "
+                "(ensure correct module path and exact symbol name)."
+            )
+        }
+
+    def _regex_definition_search(self, entity_name: str, symbol_kind: str, files: List[pathlib.Path]) -> Optional[Dict[str, Any]]:
+        try:
+            if symbol_kind == 'function':
+                pattern = re.compile(rf"^\s*def\s+{re.escape(entity_name)}\s*\(.*", re.MULTILINE)
+            else:
+                pattern = re.compile(rf"^\s*class\s+{re.escape(entity_name)}\b.*", re.MULTILINE)
+        except re.error:
+            return None
+        for file in files:
+            try:
+                text = file.read_text(encoding='utf-8', errors='ignore')
+            except Exception:
+                continue
+            m = pattern.search(text)
+            if not m:
+                continue
+            # Grab a snippet around the match (definition line + up to 120 lines after)
+            lines = text.splitlines()
+            start_idx = text[:m.start()].count('\n')
+            end_idx = min(len(lines), start_idx + 120)
+            snippet = '\n'.join(lines[start_idx:end_idx])
+            return {
+                'name': entity_name,
+                'context_name_requested': entity_name,
+                'file_path': str(file),
+                'source': snippet or 'None'
+            }
+        return None
+
+    def _resolve_module_and_class(self, module_name: str, class_name: Optional[str]) -> tuple[str, Optional[str]]:
+        """Handle cases where module_name accidentally includes a class segment.
+        Example: module_name='engine.neo.hi.ClassName', class_name=None → returns ('engine.neo.hi', 'ClassName')
+        """
+        if class_name:
+            return module_name, class_name
+        parts = module_name.split('.')
+        if len(parts) <= 1:
+            return module_name, None
+        # Try importing full module; if it fails, pop the last segment as potential class
+        spec = importlib.util.find_spec(module_name)
+        if spec is not None:
+            return module_name, None
+        potential_class = parts[-1]
+        base_module = '.'.join(parts[:-1])
+        base_spec = importlib.util.find_spec(base_module)
+        if base_spec is None:
+            return module_name, None
+        # Heuristic: Treat last segment as class if it looks like a ClassName
+        if potential_class and potential_class[:1].isupper():
+            return base_module, potential_class
+        return module_name, None
+
+    def _is_stdlib_module(self, module_name: str) -> bool:
+        try:
+            spec = importlib.util.find_spec(module_name)
+            if spec is None or spec.origin is None:
+                return False
+            if spec.origin == 'built-in':
+                return True
+            stdlib_path = sysconfig.get_paths().get('stdlib')
+            if not stdlib_path:
+                return False
+            return spec.origin.startswith(stdlib_path) and 'site-packages' not in spec.origin
+        except Exception:
+            return False
+
+    def _stdlib_definition_info(self, module_name: str, class_name: Optional[str], entity_name: str, symbol_kind: str) -> Optional[Dict[str, Any]]:
+        """If the symbol appears to be in the standard library or builtins, return a structured stub.
+        Attempts to include signature and doc excerpt for helpful context.
+        """
+        try:
+            if not self._is_stdlib_module(module_name):
+                return None
+            mod = importlib.import_module(module_name)
+            target_obj = None
+            if symbol_kind == 'class':
+                target_name = class_name or entity_name
+                target_obj = getattr(mod, target_name, None)
+            elif symbol_kind == 'function':
+                if class_name:
+                    cls = getattr(mod, class_name, None)
+                    target_obj = getattr(cls, entity_name, None) if cls is not None else None
+                else:
+                    target_obj = getattr(mod, entity_name, None)
+            if target_obj is None:
+                # Unknown in stdlib but in stdlib module; still return stub
+                return {
+                    'name': entity_name,
+                    'context_name_requested': f"{module_name}.{class_name + '.' if class_name else ''}{entity_name}",
+                    'file_path': f"STDLIB:{module_name}",
+                    'source': 'Standard library reference; implementation is not included. Use known behavior of the stdlib symbol.'
+                }
+            sig = None
+            try:
+                sig = str(inspect.signature(target_obj))
+            except Exception:
+                sig = None
+            doc = None
+            try:
+                doc = inspect.getdoc(target_obj)
+            except Exception:
+                doc = None
+            summary = 'Standard library symbol; use known behavior. '
+            if sig:
+                summary += f"Signature: {sig}. "
+            if doc:
+                summary += f"Doc: {doc[:800]}"
+            return {
+                'name': entity_name if symbol_kind == 'function' else (class_name or entity_name),
+                'context_name_requested': f"{module_name}.{class_name + '.' if class_name else ''}{entity_name}",
+                'file_path': f"STDLIB:{module_name}",
+                'source': summary
+            }
+        except Exception:
+            return None
     
     def _get_script(self, file: pathlib.Path) -> jedi.Script:
         key = str(file)
@@ -271,24 +430,7 @@ class SymbolExtractor:
                                 match = self._create_match_obj(inf, symbol_name)
                                 return match
                     
-        # Edge case: Nothing ever found, so we check for the code_line in the description
-        for script in scripts:
-            names = script.get_names(all_scopes=True)
-            for name in names:
-                # All these replacements are the same as we do to the code_line
-                cl = code_line.replace(' ', '').replace('\n', '').replace('"', "'").replace('\r', '').replace('\t', '')
-                desc = name.description.replace(' ', '').replace('\n', '').replace('"', "'").replace('\r', '').replace('\t', '')
-                # check for the code_line in the name.description
-                if cl in desc:
-                    match = self._create_match_obj(name, symbol_name)
-                    return match
-                # If no match, check for the code_line in the inferred description
-                inferred = name.infer()
-                for inf in inferred:
-                    idesc = inf.description.replace(' ', '').replace('\n', '').replace('"', "'").replace('\r', '').replace('\t', '')
-                    if cl in idesc:
-                        match = self._create_match_obj(inf, symbol_name)
-                        return match
+        # No anchor-based fallback anymore
 
         print('No matches found for symbol:', symbol_name)
         return

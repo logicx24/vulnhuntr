@@ -384,14 +384,15 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
 6. Context-Aware Analysis:
    - If this is a follow-up analysis, build upon previous findings in <previous_analysis> using the new information provided in the <context_code>.
    - In follow-up iterations you may request additional context. Use structured context_code entries with the following fields for each item:
-     - name: symbol name (function, method, class, or module)
-     - symbol_kind: one of function|method|class|module
+     - module_name: dotted path (e.g., engine.neo.hi)
+     - class_name: optional class name for methods or class requests
+     - entity_name: function/method/class name
+     - symbol_kind: one of function|class
      - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
      - reason: brief justification
-     - code_line: an anchor line where the symbol is referenced
    - Example requests:
-     - {"name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow", "code_line": "user = load_user(uid)"}
-     - {"name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input", "code_line": "parse_request(req)"}
+     - {"module_name": "engine.neo.hi", "class_name": null, "entity_name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow"}
+     - {"module_name": "engine.neo.hi", "class_name": "UserParser", "entity_name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input"}
    - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
 
 7. Final Review:
@@ -427,14 +428,15 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
 6. Context-Aware Analysis:
    - If this is a follow-up analysis, build upon previous findings in <previous_analysis> using the new information provided in the <context_code>.
    - In follow-up iterations you may request additional context. Use structured context_code entries with the following fields for each item:
-     - name: symbol name (function, method, class, or module)
-     - symbol_kind: one of function|method|class|module
+     - module_name: dotted path (e.g., engine.neo.hi)
+     - class_name: optional class name for methods or class requests
+     - entity_name: function/method/class name
+     - symbol_kind: one of function|class
      - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
      - reason: brief justification
-     - code_line: an anchor line where the symbol is referenced
    - Example requests:
-     - {"name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow", "code_line": "user = load_user(uid)"}
-     - {"name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input", "code_line": "parse_request(req)"}
+     - {"module_name": "engine.neo.hi", "class_name": null, "entity_name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow"}
+     - {"module_name": "engine.neo.hi", "class_name": "UserParser", "entity_name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input"}
    - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
 
 7. Final Review:

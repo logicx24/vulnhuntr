@@ -46,11 +46,12 @@ class VulnType(str, Enum):
     IDOR = "IDOR"
 
 class ContextCode(BaseModel):
-    name: str = Field(description="Function, method, class, or module name to request")
-    symbol_kind: str = Field(description="One of: function, method, class, module")
+    module_name: str = Field(description="Dotted module path where the entity resides (e.g., engine.neo.hi)")
+    class_name: str | None = Field(default=None, description="Class name for methods or when requesting a class; omit for module-level functions")
+    entity_name: str = Field(description="For symbol_kind=class, the class name. For symbol_kind=function, the function or method name")
+    symbol_kind: Literal["function", "class"] = Field(description="Type of the symbol: function or class")
     request_type: Literal["REQUEST_DEFINITION", "REQUEST_CALLERS"] = Field(description="REQUEST_DEFINITION to fetch the symbol's definition; REQUEST_CALLERS to fetch its callers")
     reason: str = Field(description="Brief reason why this context is needed for analysis")
-    code_line: str = Field(description="A representative line where this symbol is referenced or called (used as an anchor)")
 
 class Response(BaseModel):
     analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.", min_length=64)
@@ -179,8 +180,6 @@ def process_initial_task(task: Task,
     if task.file_path in primary_map:
         log.info("Skipping already analyzed file", file=task.file_path)
         return []
-    print(f"\nAnalyzing {py_f}")
-    print('-' * 40 +'\n')
     user_prompt = (
         FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
         Instructions(instructions=INITIAL_ANALYSIS_PROMPT_TEMPLATE).to_xml() + b'\n' +
@@ -265,16 +264,18 @@ def process_secondary_task(task: Task,
     added = 0
     for context_item in secondary_analysis_report.context_code:
         req_type = context_item.request_type
-        name = context_item.name
-        code_line = context_item.code_line
+        module_name = context_item.module_name
+        class_name = context_item.class_name
+        entity_name = context_item.entity_name
+        key = f"{module_name}:{class_name or ''}:{entity_name}:{context_item.symbol_kind}"
         if req_type == 'REQUEST_DEFINITION':
-            if name not in stored_defs:
-                match = code_extractor.extract(name, code_line, files)
+            if key not in stored_defs:
+                match = code_extractor.extract(module_name, class_name, entity_name, context_item.symbol_kind, files)
                 if match:
-                    stored_defs[name] = match
+                    stored_defs[key] = match
                     added += 1
         elif req_type == 'REQUEST_CALLERS':
-            callers = code_extractor.find_callers(name, list(files))
+            callers = code_extractor.find_callers(entity_name, list(files))
             for caller in callers:
                 _ = caller  # currently not enqueuing new initials here
     # Determine next iteration or finalize
@@ -518,7 +519,7 @@ def initialize_llm(llm_arg: str, system_prompt: str = "") -> Claude | ChatGPT | 
 
 def print_readable(report: Response | ResponseInitial) -> None:
     print("=" * 80)
-    print(f"RESPONSE TYPE: {type(report).__name__}")
+    print(f"File: {report.file_path} | RESPONSE TYPE: {type(report).__name__}")
     print("=" * 80)
     
     for attr, value in vars(report).items():
@@ -599,23 +600,9 @@ def run():
         # Always build a deque of files
         files_to_analyze = deque(str(p) for p in repo.get_files_to_analyze(path_to_analyze))
 
-    # Analyze the entire project guided by static scan and queue
+    # Analyze the entire project: iterate every relevant file, keep filters for tests/generated
     else:
-        # 1) Static scan to seed initial set
-        log.info("Running static bypass scan over repository")
-        scan_hits = code_extractor.static_bypass_scan(list(files))
-        prioritized_files = []
-        seen_files = set()
-        for hit in scan_hits:
-            fp = hit['file_path']
-            if fp not in seen_files:
-                prioritized_files.append(fp)
-                seen_files.add(fp)
-        # Fallback: if nothing matched, use network-related heuristics
-        if not prioritized_files:
-            prioritized_files = [str(f) for f in repo.get_network_related_files(files)]
-
-        files_to_analyze = deque(prioritized_files)
+        files_to_analyze = deque(str(f) for f in files)
     
     llm = initialize_llm(args.llm)
 
