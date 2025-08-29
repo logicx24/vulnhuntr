@@ -396,6 +396,7 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
    - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
 
 7. Final Review:
+   - Set vulnerability_present=true only if you are reasonably certain the vulnerability exists in the analyzed code path; otherwise false.
    - Confirm your proof of concept (PoC) exploits bypass any security controls.
    - Double-check that your JSON response is well-formed and complete."""
 

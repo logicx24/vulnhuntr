@@ -60,6 +60,7 @@ class Response(BaseModel):
     confidence_score: int = Field(description="0-10, where 0 is no confidence and 10 is absolute certainty because you have the entire user input to server output code path.")
     vulnerability_types: List[VulnType] = Field(description="The types of identified vulnerabilities")
     context_code: List[ContextCode] = Field(description="List of context code items requested for analysis, one function or class name per item. No standard library or third-party package code.")
+    vulnerability_present: bool = Field(description="True only if you are reasonably certain the vulnerability exists in the analyzed code path. False if inconclusive or disproven.")
 
 class ResponseInitial(BaseModel):
     analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.", min_length=64)
@@ -164,6 +165,12 @@ class FileWriter:
         self.stop_event.set()
         self.q.join()
         self.thread.join(timeout=2)
+
+    def flush(self) -> None:
+        try:
+            self.q.join()
+        except Exception:
+            pass
 
 def process_initial_task(task: Task,
                          primary_writer: 'FileWriter',
@@ -284,12 +291,15 @@ def process_secondary_task(task: Task,
     current_no_progress = (added == 0)
     finalize_now = (next_i >= 7) or (task.same_context and current_no_progress)
     if finalize_now:
-        final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
-        try:
-            final_writer.enqueue(final_rec)
-        except Exception as e:
-            log.error("Final enqueue failed", exc_info=e)
-        print_readable(str(py_f), secondary_analysis_report)
+        if secondary_analysis_report.vulnerability_present:
+            final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}
+            try:
+                final_writer.enqueue(final_rec)
+            except Exception as e:
+                log.error("Final enqueue failed", exc_info=e)
+            print_readable(str(py_f), secondary_analysis_report)
+        else:
+            log.info("Dropping final record without confirmed vulnerability", file=str(py_f), vuln_type=task.vuln_type)
         return None
     else:
         return Task(
@@ -550,7 +560,7 @@ def run():
     parser.add_argument('--api-key', type=str, help='API key for the selected LLM provider')
     parser.add_argument('--restart', action='store_true', help='Start fresh and ignore cached analyses')
     parser.add_argument('-v', '--verbosity', action='count', default=0, help='Increase output verbosity (-v for INFO, -vv for DEBUG)')
-    parser.add_argument('--parallelism', type=int, default=32, help='Max number of parallel tasks to run (default: 32)')
+    parser.add_argument('--parallelism', type=int, default=96, help='Max number of parallel tasks to run (default: 32)')
     args = parser.parse_args()
 
     repo = RepoOps(args.root)
@@ -564,6 +574,7 @@ def run():
     results_root = Path('results')
     run_dir = results_root / f"{target_dir_name}-{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {run_dir}")
     primary_cache_path = run_dir / 'vulnhuntr_primary.jsonl'
     secondary_cache_path = run_dir / 'vulnhuntr_secondary.jsonl'
     primary_map: dict[str, dict] = {}
@@ -641,7 +652,7 @@ def run():
     exclude_patterns = [
         'tests/', 'test_', 'test', '_test.py', 'conftest.py', '__pycache__/', 
         'build/', 'dist/', 'generated/', 'site-packages/', 'migrations/', 
-        '_pb2.py', '_pb2_grpc.py'
+        '_pb2.py', '_pb2_grpc.py', "venv", "virtualenv", ".git/", 
     ]
     
     filtered_files = []
@@ -673,30 +684,30 @@ def run():
 
     # Phase 1 parallel execution
     with ThreadPoolExecutor(max_workers=max(1, args.parallelism)) as pool:
-        futures = [
+        future_to_task = {
             pool.submit(
                 process_initial_task,
                 t,
                 primary_writer,
                 llm,
                 primary_map,
-            )
-            for t in list(initial_queue)
-        ]
-        for fut in as_completed(futures):
+            ): t for t in list(initial_queue)
+        }
+        for fut in as_completed(list(future_to_task.keys())):
+            task_obj = future_to_task[fut]
             try:
                 res = fut.result()
                 if res:
                     secondary_queue.extend(res)
             except Exception as e:
-                log.error("Initial task failed", exc_info=e)
+                log.error("Initial task failed", exc_info=e, file=task_obj.file_path, task_type=str(task_obj.type))
 
     # Phase 2 parallel execution with waves
     while secondary_queue:
         wave = list(secondary_queue)
         secondary_queue.clear()
         with ThreadPoolExecutor(max_workers=max(1, args.parallelism)) as pool:
-            futures = [
+            future_to_task = {
                 pool.submit(
                     process_secondary_task,
                     t,
@@ -707,19 +718,22 @@ def run():
                     secondary_map,
                     code_extractor,
                     files,
-                )
-                for t in wave
-            ]
-            for fut in as_completed(futures):
+                ): t for t in wave
+            }
+            for fut in as_completed(list(future_to_task.keys())):
+                t = future_to_task[fut]
                 try:
                     nxt = fut.result()
                     if nxt:
                         secondary_queue.append(nxt)
                 except Exception as e:
-                    log.error("Secondary task failed", exc_info=e)
+                    log.error("Secondary task failed", exc_info=e, file=t.file_path, vuln_type=t.vuln_type, iteration=t.iteration_count)
 
-    # Stop writers
-    primary_writer.stop(); secondary_writer.stop(); final_writer.stop()
+    # Flush and stop writers
+    try:
+        primary_writer.flush(); secondary_writer.flush(); final_writer.flush()
+    finally:
+        primary_writer.stop(); secondary_writer.stop(); final_writer.stop()
 
 if __name__ == '__main__':
     run()

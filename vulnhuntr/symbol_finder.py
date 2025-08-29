@@ -4,6 +4,8 @@ import re
 import importlib
 import inspect
 import sysconfig
+import os
+import sys
 from typing import List, Dict, Any, Optional
 from jedi.api.classes import Name
 from vulnhuntr.prompts import VULN_SPECIFIC_BYPASSES_AND_PROMPTS
@@ -12,7 +14,24 @@ from vulnhuntr.prompts import VULN_SPECIFIC_BYPASSES_AND_PROMPTS
 class SymbolExtractor:
     def __init__(self, repo_path: str | pathlib.Path) -> None:
         self.repo_path = pathlib.Path(repo_path)
-        self.project = jedi.Project(self.repo_path)
+        self.environment = None
+        py_exe = self._detect_venv_python()
+        if py_exe:
+            try:
+                self.environment = jedi.create_environment(py_exe, safe=False)
+            except Exception:
+                self.environment = None
+        # Ensure repository root is importable for path mapping (avoid importing repo modules directly)
+        try:
+            if str(self.repo_path) not in sys.path:
+                sys.path.insert(0, str(self.repo_path))
+        except Exception:
+            pass
+        # Initialize project; environment only assists inference, repo scanning is primary
+        try:
+            self.project = jedi.Project(self.repo_path, environment=self.environment) if self.environment else jedi.Project(self.repo_path)
+        except Exception:
+            self.project = jedi.Project(self.repo_path)
         self.parsed_symbols = None
         self.ignore = ['/test', '_test/', '/docs', '/example']
         self._script_cache: Dict[str, jedi.Script] = {}
@@ -43,11 +62,6 @@ class SymbolExtractor:
 
         # Normalize module/class by handling cases where module_name includes a trailing class
         norm_module, norm_class = self._resolve_module_and_class(module_name, class_name)
-
-        # If this appears to be a stdlib or builtin reference, surface stdlib info
-        stdlib_info = self._stdlib_definition_info(norm_module, norm_class, entity_name, symbol_kind)
-        if stdlib_info:
-            return stdlib_info
 
         # Build script list from files under module_name path hint
         scripts: List[jedi.Script] = []
@@ -84,10 +98,20 @@ class SymbolExtractor:
         if match:
             return match
 
-        # Final fallback: regex-based definition search
+        # Final fallback within repository: regex-based definition search
         rx_match = self._regex_definition_search(entity_name, symbol_kind, filtered_files)
         if rx_match:
             return rx_match
+
+        # Next, try standard library/builtins informational stub
+        stdlib_info = self._stdlib_definition_info(norm_module, norm_class, entity_name, symbol_kind)
+        if stdlib_info:
+            return stdlib_info
+
+        # Finally, try venv/third-party informational stub
+        venv_info = self._venv_definition_info(norm_module, norm_class, entity_name, symbol_kind)
+        if venv_info:
+            return venv_info
 
         # Nothing found: return a sentinel to inform the model
         return {
@@ -139,12 +163,18 @@ class SymbolExtractor:
         if len(parts) <= 1:
             return module_name, None
         # Try importing full module; if it fails, pop the last segment as potential class
-        spec = importlib.util.find_spec(module_name)
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except ModuleNotFoundError:
+            spec = None
         if spec is not None:
             return module_name, None
         potential_class = parts[-1]
         base_module = '.'.join(parts[:-1])
-        base_spec = importlib.util.find_spec(base_module)
+        try:
+            base_spec = importlib.util.find_spec(base_module)
+        except ModuleNotFoundError:
+            base_spec = None
         if base_spec is None:
             return module_name, None
         # Heuristic: Treat last segment as class if it looks like a ClassName
@@ -154,7 +184,10 @@ class SymbolExtractor:
 
     def _is_stdlib_module(self, module_name: str) -> bool:
         try:
-            spec = importlib.util.find_spec(module_name)
+            try:
+                spec = importlib.util.find_spec(module_name)
+            except ModuleNotFoundError:
+                return False
             if spec is None or spec.origin is None:
                 return False
             if spec.origin == 'built-in':
@@ -171,7 +204,7 @@ class SymbolExtractor:
         Attempts to include signature and doc excerpt for helpful context.
         """
         try:
-            if not self._is_stdlib_module(module_name):
+            if not self._is_stdlib_module(module_name) and module_name != 'builtins':
                 return None
             mod = importlib.import_module(module_name)
             target_obj = None
@@ -211,6 +244,50 @@ class SymbolExtractor:
                 'name': entity_name if symbol_kind == 'function' else (class_name or entity_name),
                 'context_name_requested': f"{module_name}.{class_name + '.' if class_name else ''}{entity_name}",
                 'file_path': f"STDLIB:{module_name}",
+                'source': summary
+            }
+        except Exception:
+            return None
+
+    def _venv_definition_info(self, module_name: str, class_name: Optional[str], entity_name: str, symbol_kind: str) -> Optional[Dict[str, Any]]:
+        """Attempt third-party/venv informational stub as a last resort after repo and stdlib checks."""
+        try:
+            # Avoid stdlib here
+            if self._is_stdlib_module(module_name):
+                return None
+            mod = importlib.import_module(module_name)
+            origin = getattr(getattr(mod, '__spec__', None), 'origin', None)
+            if not origin or ('site-packages' not in origin and 'dist-packages' not in origin):
+                return None
+            target_obj = None
+            if symbol_kind == 'class':
+                target_name = class_name or entity_name
+                target_obj = getattr(mod, target_name, None)
+            elif symbol_kind == 'function':
+                if class_name:
+                    cls = getattr(mod, class_name, None)
+                    target_obj = getattr(cls, entity_name, None) if cls is not None else None
+                else:
+                    target_obj = getattr(mod, entity_name, None)
+            sig = None
+            try:
+                sig = str(inspect.signature(target_obj)) if target_obj else None
+            except Exception:
+                sig = None
+            doc = None
+            try:
+                doc = inspect.getdoc(target_obj) if target_obj else None
+            except Exception:
+                doc = None
+            summary = 'Third-party library symbol; use known behavior. '
+            if sig:
+                summary += f"Signature: {sig}. "
+            if doc:
+                summary += f"Doc: {doc[:800]}"
+            return {
+                'name': entity_name if symbol_kind == 'function' else (class_name or entity_name),
+                'context_name_requested': f"{module_name}.{class_name + '.' if class_name else ''}{entity_name}",
+                'file_path': f"SITE-PACKAGES:{module_name}",
                 'source': summary
             }
         except Exception:
@@ -481,9 +558,9 @@ class SymbolExtractor:
     
     def _create_match_obj(self, name: Name, symbol_name: str) -> Dict[str, Any]:
         module_path = str(name.module_path)
-        if '/third_party/' in module_path or module_path == 'None':
-            # Extract the third party library name
-            source = f'Third party library. Claude, use what you already know about {name.full_name} to understand the code.'
+        if module_path == 'None' or 'site-packages' in module_path or 'dist-packages' in module_path or '/third_party/' in module_path:
+            # Third-party or venv library reference; provide guidance instead of source dump
+            source = f'Third party library (possibly from a virtual environment). Use what you already know about {name.full_name} to understand the code.'
         else:
             start = name.get_definition_start_position()
             end = name.get_definition_end_position()
@@ -496,3 +573,21 @@ class SymbolExtractor:
                 'context_name_requested': symbol_name,
                 'file_path': str(name.module_path),
                 'source':source}
+
+    def _detect_venv_python(self) -> Optional[str]:
+        """Detect a virtual environment Python executable under the target repo if present."""
+        candidates = ['.venv', 'venv', 'env', 'ENV', 'virtualenv']
+        for c in candidates:
+            v = (self.repo_path / c)
+            if not v.is_dir():
+                continue
+            # Unix-like
+            for exe in ('python3', 'python'):
+                p = v / 'bin' / exe
+                if p.exists():
+                    return str(p)
+            # Windows
+            p = v / 'Scripts' / 'python.exe'
+            if p.exists():
+                return str(p)
+        return None
