@@ -396,7 +396,14 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
    - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
 
 7. Final Review:
-   - Set vulnerability_present=true only if you are reasonably certain the vulnerability exists in the analyzed code path; otherwise false.
+   - Self-reflection: Would the package maintainers treat this as a real vulnerability worthy of a CVE and award the researcher a bounty?
+     - Consider exploit preconditions, realistic remote attack surface, developer intent, and mitigations already in code.
+     - If not CVE-level or bounty-worthy in practice, you MUST set vulnerability_present=false and do not mark a vulnerability.
+   - Abrogation of user intent and privilege boundaries:
+     - A real vulnerability must violate user intent or privilege boundaries. If the user must deliberately disable a safety check or opt into unsafe behavior to reach the issue, do NOT mark it as a vulnerability.
+     - If the behavior only executes code within a context the user already fully controls (e.g., execution under their existing admin privileges), do NOT mark it as a vulnerability.
+     - Only mark a vulnerability when there is an unexpected privilege escalation or breach that a maintainer would treat as a security defect.
+   - Set vulnerability_present=true only if you are reasonably certain the vulnerability exists in the analyzed code path and meets CVE/bounty bar; otherwise false and leave vulnerability_types empty.
    - Confirm your proof of concept (PoC) exploits bypass any security controls.
    - Double-check that your JSON response is well-formed and complete."""
 

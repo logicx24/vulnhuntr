@@ -6,6 +6,7 @@ import inspect
 import sysconfig
 import os
 import sys
+import pickle
 from typing import List, Dict, Any, Optional
 from jedi.api.classes import Name
 from vulnhuntr.prompts import VULN_SPECIFIC_BYPASSES_AND_PROMPTS
@@ -80,23 +81,37 @@ class SymbolExtractor:
                 except Exception:
                     continue
 
-        
-        # Search using jedi.Script.search; uses the code_line from bot to grep for string in files
+        # Search using jedi.Script.search
         search_token = entity_name if not norm_class else (entity_name if symbol_kind == 'function' else norm_class)
-        match = self.file_search(search_token, scripts)
-        if match:
-            return match
+        try:
+            match = self.file_search(search_token, scripts)
+            if match:
+                return match
+        except pickle.UnpicklingError:
+            rx_match = self._regex_definition_search(entity_name, symbol_kind, filtered_files)
+            if rx_match:
+                return rx_match
 
-        # Search using jedi.Project.search(); finds matches and class instance variables like "var = ClassName(); var.method()"
-        match = self.project_search(search_token)
-        if match:
-            return match
+        # Search using jedi.Project.search
+        try:
+            match = self.project_search(search_token)
+            if match:
+                return match
+        except pickle.UnpicklingError:
+            rx_match = self._regex_definition_search(entity_name, symbol_kind, filtered_files)
+            if rx_match:
+                return rx_match
         
         # Still no match, so we search using jedi.Script.get_names(); handles method calls on variables
         symbol_parts = (f"{norm_class}.{entity_name}" if norm_class else entity_name).split('.')
-        match = self.all_names_search(search_token, symbol_parts, scripts, '')
-        if match:
-            return match
+        try:
+            match = self.all_names_search(search_token, symbol_parts, scripts, '')
+            if match:
+                return match
+        except pickle.UnpicklingError:
+            rx_match = self._regex_definition_search(entity_name, symbol_kind, filtered_files)
+            if rx_match:
+                return rx_match
 
         # Final fallback within repository: regex-based definition search
         rx_match = self._regex_definition_search(entity_name, symbol_kind, filtered_files)
@@ -304,7 +319,7 @@ class SymbolExtractor:
         try:
             script = self._get_script(file_path)
             names = script.get_names(all_scopes=True, definitions=True)
-        except Exception:
+        except (Exception, pickle.UnpicklingError):
             return None
 
         best = None
