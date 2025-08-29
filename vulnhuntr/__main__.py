@@ -62,6 +62,11 @@ class Response(BaseModel):
     context_code: List[ContextCode] = Field(description="List of context code items requested for analysis, one function or class name per item. No standard library or third-party package code.")
     vulnerability_present: bool = Field(description="True only if you are reasonably certain the vulnerability exists in the analyzed code path. False if inconclusive or disproven.")
 
+class ResponseTertiary(BaseModel):
+    analysis: str = Field(description="Brief rationale for the final PoC shape.")
+    poc_steps: str = Field(description="Step-by-step instructions to reproduce, concrete and deterministic.")
+    context_code: List[ContextCode] = Field(description="Any additional context requested to complete the PoC.")
+
 class ResponseInitial(BaseModel):
     analysis: str = Field(description="Your final analysis. Output in plaintext with no line breaks.", min_length=64)
     confidence_score: int = Field(description="0-10, where 0 is no confidence and 10 is absolute certainty because you have the entire user input to server output code path.")
@@ -114,6 +119,7 @@ class FileFilterResult(BaseModel):
 class TaskType(str, Enum):
     INITIAL = "initial"
     SECONDARY = "secondary"
+    TERTIARY = "tertiary"
 
 class Task(BaseModel):
     type: TaskType
@@ -125,6 +131,7 @@ class Task(BaseModel):
     stored_code_definitions: dict = {}
     same_context: bool = False
     previous_context_amount: int = 0
+    poc_steps: str | None = None
 
     
 def _is_proto_or_generated(path: str) -> bool:
@@ -283,9 +290,52 @@ def process_secondary_task(task: Task,
                     stored_defs[key] = match
                     added += 1
         elif req_type == 'REQUEST_CALLERS':
+            # Find call sites and include the enclosing caller function/class definitions as context
             callers = code_extractor.find_callers(entity_name, list(files))
+            max_callers_to_add = 5
+            num_added_here = 0
             for caller in callers:
-                _ = caller  # currently not enqueuing new initials here
+                if num_added_here >= max_callers_to_add:
+                    break
+                try:
+                    caller_fp = Path(caller.get('file_path'))
+                    line_no = int(caller.get('line_no', 0))
+                except Exception:
+                    continue
+                encl = code_extractor.get_enclosing_symbol(caller_fp, line_no)
+                if not encl or not encl.get('name') or not encl.get('type'):
+                    continue
+                symbol_kind = 'function' if encl['type'] == 'function' else 'class'
+                caller_key = f"CALLER:{str(caller_fp)}:{encl['name']}:{symbol_kind}"
+                if caller_key in stored_defs:
+                    continue
+                try:
+                    source = code_extractor._get_definition_source(caller_fp, encl.get('start'), encl.get('end'))
+                except Exception:
+                    # Fallback to simple slice read
+                    try:
+                        with caller_fp.open(encoding='utf-8') as f:
+                            lines = f.readlines()
+                        s_row, s_col = encl['start']
+                        e_row, e_col = encl['end']
+                        snippet_lines = lines[s_row-1:e_row]
+                        if snippet_lines:
+                            if snippet_lines:
+                                snippet_lines[0] = snippet_lines[0][s_col:]
+                            if snippet_lines:
+                                last_idx = len(snippet_lines) - 1
+                                snippet_lines[last_idx] = snippet_lines[last_idx][:e_col]
+                        source = ''.join(snippet_lines) if snippet_lines else 'None'
+                    except Exception:
+                        source = 'None'
+                stored_defs[caller_key] = {
+                    'name': encl['name'],
+                    'context_name_requested': encl['name'],
+                    'file_path': str(caller_fp),
+                    'source': source or 'None',
+                }
+                added += 1
+                num_added_here += 1
     # Determine next iteration or finalize
     next_i = i + 1
     current_no_progress = (added == 0)
@@ -298,9 +348,18 @@ def process_secondary_task(task: Task,
             except Exception as e:
                 log.error("Final enqueue failed", exc_info=e)
             print_readable(str(py_f), secondary_analysis_report)
+            # seed tertiary task to formalize PoC
+            return Task(
+                type=TaskType.TERTIARY,
+                file_path=str(py_f),
+                vuln_type=task.vuln_type,
+                iteration_count=0,
+                previous_analysis=secondary_analysis_report.analysis,
+                stored_code_definitions=stored_defs,
+            )
         else:
             log.info("Dropping final record without confirmed vulnerability", file=str(py_f), vuln_type=task.vuln_type)
-        return None
+            return None
     else:
         return Task(
             type=TaskType.SECONDARY,
@@ -312,6 +371,60 @@ def process_secondary_task(task: Task,
             same_context=(task.same_context or current_no_progress),
             previous_context_amount=len(stored_defs),
         )
+
+def process_tertiary_task(task: Task,
+                          final_writer: 'FileWriter',
+                          llm: Claude | ChatGPT | Ollama | OpenRouter,
+                          code_extractor: SymbolExtractor,
+                          files: List[Path]) -> Task | None:
+    py_f = Path(task.file_path)
+    try:
+        with py_f.open(encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        log.error("Tertiary read failed", file=str(py_f), exc_info=e)
+        return None
+    if not content:
+        return None
+    stored_defs = task.stored_code_definitions or {}
+    definitions = CodeDefinitions(definitions=list(stored_defs.values()))
+    user_prompt = (
+        FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
+        definitions.to_xml() + b'\n' +
+        PreviousAnalysis(previous_analysis=task.previous_analysis).to_xml() + b'\n' +
+        Instructions(instructions=POC_FORMALIZATION_PROMPT_TEMPLATE).to_xml() + b'\n' +
+        ResponseFormat(response_format=json.dumps(ResponseTertiary.model_json_schema(), indent=4)).to_xml()
+    ).decode()
+    log.info("Tertiary PoC formalization", file=py_f, vuln_type=task.vuln_type)
+    report: ResponseTertiary = llm.chat(user_prompt, response_model=ResponseTertiary)
+    # If the model needs new context, fetch it and requeue
+    added = 0
+    for context_item in report.context_code:
+        module_name = context_item.module_name
+        class_name = context_item.class_name
+        entity_name = context_item.entity_name
+        key = f"{module_name}:{class_name or ''}:{entity_name}:{context_item.symbol_kind}"
+        if key not in stored_defs:
+            match = code_extractor.extract(module_name, class_name, entity_name, context_item.symbol_kind, files)
+            if match:
+                stored_defs[key] = match
+                added += 1
+    if added > 0:
+        return Task(
+            type=TaskType.TERTIARY,
+            file_path=str(py_f),
+            vuln_type=task.vuln_type,
+            iteration_count=(task.iteration_count or 0) + 1,
+            previous_analysis=task.previous_analysis,
+            stored_code_definitions=stored_defs,
+        )
+    # Otherwise, finalize by writing an updated record with poc_steps
+    final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, "poc_steps": report.poc_steps}
+    try:
+        final_writer.enqueue(final_rec)
+    except Exception as e:
+        log.error("Final PoC enqueue failed", exc_info=e)
+    return None
 
 class RepoOps:
     def __init__(self, repo_path: Path | str ) -> None:
@@ -617,12 +730,20 @@ def run():
         else:
             path_to_analyze = Path(args.root) / analyze_path
 
-        # Always build a deque of files
-        files_to_analyze = deque(str(p) for p in repo.get_files_to_analyze(path_to_analyze))
+        # Prioritize network-related files within the specified path
+        path_files = list(repo.get_files_to_analyze(path_to_analyze))
+        network_first = list(repo.get_network_related_files(path_files))
+        network_set = {str(p) for p in network_first}
+        ordered = network_first + [p for p in path_files if str(p) not in network_set]
+        files_to_analyze = deque(str(p) for p in ordered)
 
     # Analyze the entire project: iterate every relevant file, keep filters for tests/generated
     else:
-        files_to_analyze = deque(str(f) for f in files)
+        # Prioritize network-related files across the repository
+        network_first = list(repo.get_network_related_files(files))
+        network_set = set(network_first)
+        ordered_files = network_first + [p for p in files if p not in network_set]
+        files_to_analyze = deque(str(f) for f in ordered_files)
     
     llm = initialize_llm(args.llm, model=args.model, base_url=args.base_url, api_key=args.api_key)
 
@@ -703,6 +824,7 @@ def run():
                 log.error("Initial task failed", exc_info=e, file=task_obj.file_path, task_type=str(task_obj.type))
 
     # Phase 2 parallel execution with waves
+    tertiary_queue: deque[Task] = deque()
     while secondary_queue:
         wave = list(secondary_queue)
         secondary_queue.clear()
@@ -725,9 +847,36 @@ def run():
                 try:
                     nxt = fut.result()
                     if nxt:
-                        secondary_queue.append(nxt)
+                        if nxt.type == TaskType.SECONDARY:
+                            secondary_queue.append(nxt)
+                        elif nxt.type == TaskType.TERTIARY:
+                            tertiary_queue.append(nxt)
                 except Exception as e:
                     log.error("Secondary task failed", exc_info=e, file=t.file_path, vuln_type=t.vuln_type, iteration=t.iteration_count)
+
+    # Phase 3: Tertiary PoC formalization
+    while tertiary_queue:
+        wave = list(tertiary_queue)
+        tertiary_queue.clear()
+        with ThreadPoolExecutor(max_workers=max(1, args.parallelism)) as pool:
+            future_to_task = {
+                pool.submit(
+                    process_tertiary_task,
+                    t,
+                    final_writer,
+                    llm,
+                    code_extractor,
+                    files,
+                ): t for t in wave
+            }
+            for fut in as_completed(list(future_to_task.keys())):
+                t = future_to_task[fut]
+                try:
+                    nxt = fut.result()
+                    if nxt:
+                        tertiary_queue.append(nxt)
+                except Exception as e:
+                    log.error("Tertiary task failed", exc_info=e, file=t.file_path, vuln_type=t.vuln_type, iteration=t.iteration_count)
 
     # Flush and stop writers
     try:

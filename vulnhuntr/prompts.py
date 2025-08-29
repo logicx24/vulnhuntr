@@ -390,6 +390,8 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
      - symbol_kind: one of function|class
      - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
      - reason: brief justification
+   - Before adding any context_code item, check if the symbol's definition is already present in <file_code>. If it is, do NOT request it; read the in-file code directly.
+   - Only request cross-file context: request definitions or callers located in other files/modules. For callers within the same file, infer from the provided <file_code> instead of requesting.
    - Example requests:
      - {"module_name": "engine.neo.hi", "class_name": null, "entity_name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow"}
      - {"module_name": "engine.neo.hi", "class_name": "UserParser", "entity_name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input"}
@@ -475,4 +477,27 @@ The project's README summary is provided in <readme_summary> tags. Use this to u
 Remember, you have many opportunities to respond and request additional context. Use them wisely to build a comprehensive understanding of the application's security posture.
 
 Output your findings in JSON format, conforming to the schema in <response_format> tags.
+"""
+
+# Tertiary: PoC formalization prompt
+POC_FORMALIZATION_PROMPT_TEMPLATE = """
+You have confirmed a remotely exploitable vulnerability. Your goal now is to formalize an end-to-end, step-by-step Proof of Concept (PoC) that a security engineer can follow to reproduce it.
+
+Requirements:
+1) Concise, deterministic steps:
+   - State exact preconditions (auth tokens/roles, environment config, endpoints, versions).
+   - Provide concrete commands, HTTP/gRPC requests (method, URL, headers, body), or code snippets to run.
+   - Include expected observable effects (status codes, logs, outputs) at each step.
+2) Cross-file context (only if needed):
+   - Before adding any context_code item, check if the symbol's definition is already present in <file_code>. If it is, read the in-file code directly and do not request it.
+   - Only request cross-file context located in other files/modules. For callers within the same file, infer from <file_code>.
+   - Use the structured context_code format to request more definitions/callers as needed.
+3) Scope and validity:
+   - Ensure the PoC chain starts from a plausible remote entry point and ends at a security-impacting sink.
+   - Do not assume special deployment or usage patterns. The vulnerability must be reproducible using current, standard public APIs and typical usage. It should not require nonstandard setups (e.g., running behind a web service if the framework is commonly used locally).
+   - Avoid PoCs that require disabling safety checks intentionally; do not rely on admin-only capabilities the attacker already controls.
+   - If new information invalidates the PoC’s viability, clearly set a next context request or revise steps.
+4) Output:
+   - Provide step-by-step PoC instructions in a single field (poc_steps) that are directly followable.
+   - Keep it concise and unambiguous.
 """

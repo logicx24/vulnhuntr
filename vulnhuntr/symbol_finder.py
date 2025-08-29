@@ -399,6 +399,7 @@ class SymbolExtractor:
             except (UnicodeDecodeError, OSError):
                 continue
         return results
+
     def file_search(self, symbol_name: str, scripts: List) -> Dict[str, Any]:
         # Analyze matching files with Jedi
         for script in scripts:
