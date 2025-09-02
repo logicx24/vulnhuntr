@@ -1,13 +1,10 @@
 import logging
 import json
-import time
 from typing import List, Union, Dict, Any
 from pydantic import BaseModel, ValidationError
-import anthropic
 import os
 import openai
 import dotenv
-import requests
 
 dotenv.load_dotenv()
 
@@ -19,15 +16,6 @@ class LLMError(Exception):
 
 class RateLimitError(LLMError):
     pass
-
-class APIConnectionError(LLMError):
-    pass
-
-class APIStatusError(LLMError):
-    def __init__(self, status_code: int, response: Dict[str, Any]):
-        self.status_code = status_code
-        self.response = response
-        super().__init__(f"Received non-200 status code: {status_code}")
 
 # Base LLM class to handle common functionality
 class LLM:
@@ -128,8 +116,6 @@ class LLM:
 
     def _validate_response(self, response_text: str, response_model: BaseModel) -> BaseModel:
         # Multiple strategies to coerce into the schema (balanced extraction, direct, loads, naive slice)
-        if self.prefill:
-            response_text = self.prefill + response_text
         text = self._strip_code_fences(response_text)
         if not text or not text.strip():
             raise LLMError("Empty response from model")
@@ -226,85 +212,8 @@ class LLM:
             self._add_to_history("assistant", response_text or "")
             return response_text
 
-class Claude(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
-        super().__init__(system_prompt)
-        # API key can be provided explicitly or via environment variable
-        self.client = anthropic.Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"), max_retries=3, base_url=base_url)
-        self.model = model
-
-    def create_messages(self, user_prompt: str) -> List[Dict[str, str]]:
-        if "Provide a very concise summary of the README.md content" in user_prompt:
-            messages = [{"role": "user", "content": user_prompt}]
-        else:
-            self.prefill = "{    \"scratchpad\": \"1."
-            messages = [{"role": "user", "content": user_prompt}, 
-                        {"role": "assistant", "content": self.prefill}]
-        return messages
-
-    def send_message(self, messages: List[Dict[str, str]], max_tokens: int, response_model: BaseModel) -> Dict[str, Any]:
-        
-        # response_model is not used here, only in ChatGPT
-        return self.client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=self.system_prompt,
-            messages=messages
-        )        
-
-    def get_response(self, response: Dict[str, Any]) -> str:
-        return response.content[0].text.replace('\n', '')
-
-
-class ChatGPT(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
-        super().__init__(system_prompt)
-        self.client = openai.OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"), base_url=base_url)
-        self.model = model
-
-    def create_messages(self, user_prompt: str) -> List[Dict[str, str]]:
-        messages = [{"role": "system", "content": self.system_prompt}, 
-                    {"role": "user", "content": user_prompt}]
-        return messages
-
-    def send_message(self, messages: List[Dict[str, str]], max_tokens: int, response_model=None) -> Dict[str, Any]:
-        params = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }
-
-        # Add response format configuration if a model is provided
-        if response_model:
-            schema = None
-            try:
-                schema = response_model.model_json_schema()
-            except Exception:
-                schema = None
-            if schema:
-                params["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "VulnhuntrResponse",
-                        "schema": schema,
-                        "strict": True,
-                    },
-                }
-            else:
-                params["response_format"] = {"type": "json_object"}
-            # Lower temperature to reduce format drift for structured outputs
-            params["temperature"] = 0.2
-
-            return self.client.chat.completions.create(**params)
-
-
-    def get_response(self, response: Dict[str, Any]) -> str:
-        response = response.choices[0].message.content
-        return response
-
-
 class OpenRouter(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
+    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None, reasoning_effort: str | None = None) -> None:
         super().__init__(system_prompt)
         default_headers = {}
         # Optional but recommended headers for OpenRouter analytics/rate limits
@@ -319,6 +228,7 @@ class OpenRouter(LLM):
             default_headers=default_headers or None,
         )
         self.model = model
+        self.reasoning_effort = reasoning_effort
 
     def create_messages(self, user_prompt: str) -> List[Dict[str, str]]:
         messages = [{"role": "system", "content": self.system_prompt},
@@ -350,47 +260,49 @@ class OpenRouter(LLM):
             else:
                 params["response_format"] = {"type": "json_object"}
             params["temperature"] = 0.2
-        return self.client.chat.completions.create(**params)
+        # Add reasoning param if requested (OpenRouter extended schema)
+        if self.reasoning_effort:
+            params["reasoning_effort"] = self.reasoning_effort
+        # First attempt with current params
+        try:
+            return self.client.chat.completions.create(**params)
+        except Exception as e:
+            msg = str(e)
+            # Fallback for invalid JSON schema (provider limitation)
+            if (
+                "invalid_json_schema" in msg
+                or "Invalid schema for response_format" in msg
+                or "text.format.schema" in msg
+            ) and response_model:
+                try:
+                    pf = params
+                    pf = dict(pf)
+                    pf.pop("response_format", None)
+                    pf["response_format"] = {"type": "json_object"}
+                    pf["temperature"] = 0.2
+                    return self.client.chat.completions.create(**pf)
+                except Exception as e2:
+                    msg2 = str(e2)
+                    # If reasoning not supported, strip and retry once more
+                    if "reasoning" in msg2 or "reasoning_effort" in msg2:
+                        pf.pop("reasoning_effort", None)
+                        return self.client.chat.completions.create(**pf)
+                    raise
+            # If reasoning not supported by backend/SDK, strip and retry
+            if "reasoning" in msg or "reasoning_effort" in msg:
+                params.pop("reasoning_effort", None)
+                return self.client.chat.completions.create(**params)
+            raise
 
     def get_response(self, response: Dict[str, Any]) -> str:
         response = response.choices[0].message.content
         return response
 
-class Ollama(LLM):
-    def __init__(self, model: str, base_url: str, system_prompt: str = "", api_key: str | None = None) -> None:
-        super().__init__(system_prompt)
-        self.api_url = base_url
-        self.model = model
-
-    def create_messages(self, user_prompt: str) -> str:
-        return user_prompt
-
-    def send_message(self, user_prompt: str, max_tokens: int, response_model: BaseModel) -> Dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "prompt": user_prompt,
-            "options": {
-            "temperature": 1,
-            "system": self.system_prompt,
-            }
-            ,"stream":False,
-        }
-
-        try:
-            response = requests.post(self.api_url, json=payload)
-            return response
-        except requests.exceptions.RequestException as e:
-            if e.response.status_code == 429:
-                raise RateLimitError("Request was rate-limited") from e
-            elif e.response.status_code >= 500:
-                raise APIConnectionError("Server could not be reached") from e
-            else:
-                raise APIStatusError(e.response.status_code, e.response.json()) from e
-
-    def get_response(self, response: Dict[str, Any]) -> str:
-        response = response.json()['response']
-        return response
-
     def _log_response(self, response: Dict[str, Any]) -> None:
-        log.debug("Received chat response", extra={"usage": "Ollama"})
+        try:
+            usage = getattr(response, "usage", None)
+            usage = getattr(usage, "__dict__", usage)
+            log.debug("Received chat response", extra={"usage": usage})
+        except Exception:
+            log.debug("Received chat response")
 

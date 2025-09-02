@@ -290,9 +290,9 @@ VULN_SPECIFIC_BYPASSES_AND_PROMPTS = {
 }
 
 INITIAL_ANALYSIS_PROMPT_TEMPLATE = """
-Analyze the code in <file_code> for potential remotely exploitable vulnerabilities. Be concise. Do NOT request context in this pass. Your goal is to identify concrete vulnerability candidates and seed follow-up tasks:
-1. Identify all remote user input entry points (e.g., API endpoints, form submissions) and if you can't find that, request the necessary classes or functions in the <context_code> tags.
-2. Locate potential vulnerability sinks for:
+Analyze the code in <file_code> for potential remotely exploitable vulnerabilities. Be concise. Do NOT request any cross-file context in this pass. Your goal is to identify concrete vulnerability candidates and seed follow-up tasks:
+1. Identify remote user input entry points (e.g., API endpoints, form submissions).
+2. Locate potential high-risk sinks for:
    - Local File Inclusion (LFI)
    - Arbitrary File Overwrite (AFO)
    - Server-Side Request Forgery (SSRF)
@@ -300,14 +300,14 @@ Analyze the code in <file_code> for potential remotely exploitable vulnerabiliti
    - Cross-Site Scripting (XSS)
    - SQL Injection (SQLI)
    - Insecure Direct Object Reference (IDOR)
-3. Note any security controls or sanitization measures encountered along the way.
-4. Instead of requesting context in this pass, list the vulnerability candidates you want to investigate in follow-up, and the symbols that are likely relevant (functions/classes/methods/modules). The system will schedule a follow-up iteration per vulnerability.
+3. Note any security controls or sanitization measures encountered.
+4. Do not attempt to request or enumerate cross-file context; that will be handled in the next phase.
 
 Important exclusions:
 - Ignore test files and directories (e.g., tests/, test_*, *_test.py, conftest.py)
 - Ignore generated or build artifacts (e.g., __pycache__/, build/, dist/, generated/, site-packages/, migrations/, *_pb2.py, *_pb2_grpc.py)
 
-Be generous and thorough in identifying potential vulnerabilities as you'll analyze more code in subsequent steps so if there's just a possibility of a vulnerability, include it the <vulnerability_types> tags.
+Only include vulnerability_types if you can name a plausible entrypoint and a plausible sink for the same code path.
 
 Examples of follow-up symbols (do NOT request in this pass):
  - load_user (function) — to inspect definition
@@ -359,60 +359,16 @@ GUIDELINES_TEMPLATE_INITIAL = """Reporting Guidelines (Initial Analysis):
    - Do not include proof-of-concept exploits in this phase.
 
 3. Requirements:
-   - Include at least one vulnerability_type if any plausible candidate is identified.
+   - Include at least one vulnerability_type only if a plausible vulnerability candidate exists in this file.
    - Provide a confidence score (0-10) with brief justification.
+   - Do NOT request any cross-file context in this phase.
 """
 
-ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
-1. Comprehensive Review:
-   - Thoroughly examine the content in <file_code>, <context_code> tags (if provided) with a focus on remotely exploitable vulnerabilities.
-
-2. Vulnerability Scanning:
-   - You only care about remotely exploitable network related components and remote user input handlers.
-   - Identify potential entry points for vulnerabilities.
-   - Consider non-obvious attack vectors and edge cases.
-
-3. Code Path Analysis:
-   - Very important: trace the flow of user input from remote request source to function sink.
-   - Examine input validation, sanitization, and encoding practices.
-   - Analyze how data is processed, stored, and output.
-
-4. Security Control Analysis:
-   - Evaluate each security measure's implementation and effectiveness.
-   - Formulate potential bypass techniques, considering latest exploit methods.
-
-6. Context-Aware Analysis:
-   - If this is a follow-up analysis, build upon previous findings in <previous_analysis> using the new information provided in the <context_code>.
-   - In follow-up iterations you may request additional context. Use structured context_code entries with the following fields for each item:
-     - module_name: dotted path (e.g., engine.neo.hi)
-     - class_name: optional class name for methods or class requests
-     - entity_name: function/method/class name
-     - symbol_kind: one of function|class
-     - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
-     - reason: brief justification
-   - Before adding any context_code item, check if the symbol's definition is already present in <file_code>. If it is, do NOT request it; read the in-file code directly.
-   - Only request cross-file context: request definitions or callers located in other files/modules. For callers within the same file, infer from the provided <file_code> instead of requesting.
-   - Example requests:
-     - {"module_name": "engine.neo.hi", "class_name": null, "entity_name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow"}
-     - {"module_name": "engine.neo.hi", "class_name": "UserParser", "entity_name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input"}
-   - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
-
-7. Final Review:
-   - Self-reflection: Would the package maintainers treat this as a real vulnerability worthy of a CVE and award the researcher a bounty?
-     - Consider exploit preconditions, realistic remote attack surface, developer intent, and mitigations already in code.
-     - If not CVE-level or bounty-worthy in practice, you MUST set vulnerability_present=false and do not mark a vulnerability.
-   - Abrogation of user intent and privilege boundaries:
-     - A real vulnerability must violate user intent or privilege boundaries. If the user must deliberately disable a safety check or opt into unsafe behavior to reach the issue, do NOT mark it as a vulnerability.
-     - If the behavior only executes code within a context the user already fully controls (e.g., execution under their existing admin privileges), do NOT mark it as a vulnerability.
-     - Only mark a vulnerability when there is an unexpected privilege escalation or breach that a maintainer would treat as a security defect.
-   - Set vulnerability_present=true only if you are reasonably certain the vulnerability exists in the analyzed code path and meets CVE/bounty bar; otherwise false and leave vulnerability_types empty.
-   - Confirm your proof of concept (PoC) exploits bypass any security controls.
-   - Double-check that your JSON response is well-formed and complete."""
 
 ANALYSIS_APPROACH_TEMPLATE_INITIAL = """Analysis Instructions (Initial, be concise):
 1. Review code in <file_code> to identify remotely exploitable vulnerability candidates.
-2. Trace likely input-to-sink paths at a high level; do not request context.
-3. Note relevant symbols to investigate in follow-up (definitions or callers).
+2. Briefly note likely input-to-sink paths at a high level using only the current file.
+3. Do not request cross-file context; defer this to the follow-up phase.
 4. Do not include proof-of-concept exploits in this phase.
 5. Ensure the response conforms to the provided JSON schema.
 """
@@ -438,18 +394,37 @@ ANALYSIS_APPROACH_TEMPLATE = """Analysis Instructions (be concise):
 6. Context-Aware Analysis:
    - If this is a follow-up analysis, build upon previous findings in <previous_analysis> using the new information provided in the <context_code>.
    - In follow-up iterations you may request additional context. Use structured context_code entries with the following fields for each item:
-     - module_name: dotted path (e.g., engine.neo.hi)
+     - module_name: dotted path (e.g., engine.neo.hi). If unsure of the module, omit this field (set to null) and rely on entity_name + class_name.
      - class_name: optional class name for methods or class requests
      - entity_name: function/method/class name
      - symbol_kind: one of function|class
      - request_type: REQUEST_DEFINITION or REQUEST_CALLERS
      - reason: brief justification
+   - Before adding any context_code item, check if the symbol's definition is already present in <file_code>. If it is, do NOT request it; read the in-file code directly.
+   - Only request cross-file context: request definitions or callers located in other files/modules. For callers within the same file, infer from the provided <file_code> instead of requesting.
    - Example requests:
      - {"module_name": "engine.neo.hi", "class_name": null, "entity_name": "load_user", "symbol_kind": "function", "request_type": "REQUEST_DEFINITION", "reason": "Understand user data flow"}
      - {"module_name": "engine.neo.hi", "class_name": "UserParser", "entity_name": "parse_request", "symbol_kind": "function", "request_type": "REQUEST_CALLERS", "reason": "Trace remote input"}
    - Confirm that the requested context class or function is not already in the <context_code> tags from the user's message.
 
-7. Final Review:
+7. ChainHop Requirement (Input→Block→Sink):
+   - A vulnerability is valid ONLY if you can demonstrate a data flow chain that:
+     1) Originates from a remote input source listed in <network_sources>,
+     2) Reaches the current suspicious/vulnerable block under analysis, and
+     3) Propagates to a security-impacting sink (e.g., outbound network request, database operation, file write, model inference) where the vulnerable output is consumed.
+   - If this full chain cannot be demonstrated, set vulnerability_present=false.
+   - Decision policy: Do NOT set vulnerability_present=true until the complete chain is assembled. If the chain is incomplete, request the precise missing context_code items and leave vulnerability_present=false.
+   - Populate the chain array in your JSON response on every iteration: include ordered hops with fields {function, file_path, start_line, end_line, role} and update it as you learn more. Use <chain_so_far> if provided as the starting point and extend it.
+
+8. Final Review:
+   - Self-reflection: Would the package maintainers treat this as a real vulnerability worthy of a CVE and award the researcher a bounty?
+     - Consider exploit preconditions, realistic remote attack surface, developer intent, and mitigations already in code.
+     - If not CVE-level or bounty-worthy in practice, you MUST set vulnerability_present=false and do not mark a vulnerability.
+   - Abrogation of user intent and privilege boundaries:
+     - A real vulnerability must violate user intent or privilege boundaries. If the user must deliberately disable a safety check or opt into unsafe behavior to reach the issue, do NOT mark it as a vulnerability.
+     - If the behavior only executes code within a context the user already fully controls (e.g., execution under their existing admin privileges), do NOT mark it as a vulnerability.
+     - Only mark a vulnerability when there is an unexpected privilege escalation or breach that a maintainer would treat as a security defect.
+   - Set vulnerability_present=true only if you are reasonably certain the vulnerability exists in the analyzed code path and meets CVE/bounty bar; otherwise false and leave vulnerability_types empty.
    - Confirm your proof of concept (PoC) exploits bypass any security controls.
    - Double-check that your JSON response is well-formed and complete."""
 
@@ -470,7 +445,7 @@ Your analysis must:
 - Consider non-obvious attack vectors and chained vulnerabilities.
 - Identify vulnerabilities that could arise from the interaction of multiple code components.
 
-If you don't have the complete code chain from user input to high-risk function, strategically request the necessary context to fill in the gaps in the <context_code> tags of your response.
+If you don't have the complete code chain from user input to high-risk function, strategically request the necessary context to fill in the gaps. Use the <context_code> tags of your response to request more code.
 
 The project's README summary is provided in <readme_summary> tags. Use this to understand the application's purpose and potential attack surfaces.
 
@@ -496,6 +471,7 @@ Requirements:
    - Ensure the PoC chain starts from a plausible remote entry point and ends at a security-impacting sink.
    - Do not assume special deployment or usage patterns. The vulnerability must be reproducible using current, standard public APIs and typical usage. It should not require nonstandard setups (e.g., running behind a web service if the framework is commonly used locally).
    - Avoid PoCs that require disabling safety checks intentionally; do not rely on admin-only capabilities the attacker already controls.
+   - Public API & Defaults: The PoC must depend purely on public, documented interfaces with default configuration. Do NOT disable safety modes (e.g., enabling unsafe deserialization), flip debug/dev flags, or introduce custom executable code on the server.
    - If new information invalidates the PoC’s viability, clearly set a next context request or revise steps.
 4) Output:
    - Provide step-by-step PoC instructions in a single field (poc_steps) that are directly followable.
