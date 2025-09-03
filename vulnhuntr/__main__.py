@@ -486,7 +486,11 @@ def process_secondary_task(task: Task,
     # Determine next iteration or finalize
     next_i = i + 1
     current_no_progress = (added == 0)
-    finalize_now = (next_i >= 15) or (task.same_context and current_no_progress)
+    finalize_now = (
+            (next_i >= 15) or 
+            (task.same_context and current_no_progress) or 
+            (secondary_analysis_report.vulnerability_present)
+    )
     if finalize_now:
         if secondary_analysis_report.vulnerability_present:
             final_rec = {"file_path": str(py_f), "vuln_type": task.vuln_type, **secondary_analysis_report.model_dump()}

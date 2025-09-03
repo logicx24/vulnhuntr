@@ -473,7 +473,20 @@ Requirements:
    - Avoid PoCs that require disabling safety checks intentionally; do not rely on admin-only capabilities the attacker already controls.
    - Public API & Defaults: The PoC must depend purely on public, documented interfaces with default configuration. Do NOT disable safety modes (e.g., enabling unsafe deserialization), flip debug/dev flags, or introduce custom executable code on the server.
    - If new information invalidates the PoC’s viability, clearly set a next context request or revise steps.
-4) Output:
-   - Provide step-by-step PoC instructions in a single field (poc_steps) that are directly followable.
-   - Keep it concise and unambiguous.
+4) Output (Executable Script Required):
+   - Provide a single, self-contained executable script that reproduces the vulnerability end-to-end.
+   - The script MUST run as-is under the stated preconditions, with no manual edits. Use either:
+     - bash/sh script (with curl for HTTP requests, environment exports, etc.), or
+     - a single runnable Python script.
+   - Emit the complete script body in one block with no prose interleaved. Include all commands needed (e.g., environment setup, requests, assertions of observable effects).
+   - The script should exit non-zero or print a clear success indicator if exploitation succeeded.
+
+********
+IMPORTANT: Incorrect Input or Non-Existent Vulnerability:
+- The provided analysis may be incorrect. If the complete input→vulnerable block→sink chain cannot be established, or if the code enforces protections that prevent exploitation, DO NOT produce any script.
+- Instead, explicitly conclude that the vulnerability is not reproducible based on current evidence and explain EXACTLY why:
+   - Cite the specific files, functions, and relevant line spans that enforce safety (e.g., safe_mode checks, parameterization, input validation, strict dtypes, path sanitization).
+   - Reference concrete data/control paths showing why attacker-controlled input cannot reach the alleged sink.
+- If a minimal additional context would change this conclusion, request it precisely via context_code; otherwise state that the chain is invalid as-is.
+*********
 """

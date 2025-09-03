@@ -104,14 +104,24 @@ class LLM:
     def _fallback_response(self, response_model: BaseModel, raw_text: str) -> BaseModel:
         # Provide a minimal valid structure so the pipeline can continue
         try:
-            return response_model.model_validate({
-                "analysis": (raw_text or ""),
-                "poc": "",
-                "confidence_score": 0,
-                "vulnerability_types": [],
-                "context_code": []
-            })
+            payload: Dict[str, Any] = {}
+            fields = getattr(response_model, 'model_fields', {})
+            for name in fields.keys():
+                if name == 'analysis':
+                    payload[name] = raw_text or ""
+                elif name in ('poc', 'poc_steps'):
+                    payload[name] = ""
+                elif name == 'confidence_score':
+                    payload[name] = 0
+                elif name in ('vulnerability_types', 'context_code', 'chain'):
+                    payload[name] = []
+                elif name == 'vulnerability_present':
+                    payload[name] = False
+                else:
+                    payload[name] = None
+            return response_model.model_validate(payload)
         except Exception as e:
+            log.error("Validation failed and fallback construction failed", exc_info=e)
             raise LLMError("Validation failed and fallback construction failed") from e
 
     def _validate_response(self, response_text: str, response_model: BaseModel) -> BaseModel:
